@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "server",
+    "wasm-module",
+]
+
+resolver = "2"

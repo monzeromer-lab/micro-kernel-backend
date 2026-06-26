@@ -1,0 +1,12 @@
+[package]
+name = "wasm-module"
+version = "0.1.0"
+edition = "2024"
+description = "Trait contract for building WASM modules for micro-kernel web backends"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/wasm-microkernel"
+readme = "README.md"
+keywords = ["wasm", "web", "module", "microkernel", "actix"]
+categories = ["wasm", "web-programming::http-server"]
+
+[dependencies]

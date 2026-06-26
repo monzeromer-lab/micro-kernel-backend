@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Micro-kernel Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --accent: #bc8cff;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    padding: 32px;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 32px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 {
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -0.5px;
+  }
+  h1 span { color: var(--accent); }
+  .status-bar {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 24px;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 24px;
+    min-width: 140px;
+  }
+  .stat .value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .stat .label {
+    font-size: 12px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 4px;
+  }
+  .module-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+    transition: border-color 0.2s;
+  }
+  .module-card:hover { border-color: var(--accent); }
+  .module-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .module-name {
+    font-size: 18px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .module-prefix {
+    color: var(--dim);
+    font-size: 13px;
+    font-weight: 400;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .badge-active { background: #1a3a2a; color: var(--green); }
+  .badge-none { background: #21262d; color: var(--dim); }
+  .slots {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .slot {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    position: relative;
+  }
+  .slot.active-slot {
+    border-color: var(--green);
+    box-shadow: 0 0 0 1px var(--green);
+  }
+  .slot-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .slot-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--dim);
+  }
+  .slot.active-slot .slot-label { color: var(--green); }
+  .slot-version {
+    font-size: 14px;
+    font-weight: 600;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+  }
+  .slot-time {
+    font-size: 11px;
+    color: var(--dim);
+    margin-top: 2px;
+  }
+  .slot-empty {
+    text-align: center;
+    color: var(--dim);
+    font-size: 13px;
+    padding: 8px 0;
+  }
+  .btn {
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--text);
+    padding: 6px 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-danger { color: var(--red); }
+  .btn-danger:hover { border-color: var(--red); background: #2d1517; }
+  .btn-primary { background: #1a2332; border-color: var(--blue); color: var(--blue); }
+  .btn-primary:hover { background: #1c2d45; }
+  .actions { display: flex; gap: 8px; }
+  .empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--dim);
+  }
+  .empty-state .icon { font-size: 48px; margin-bottom: 12px; }
+  .empty-state p { font-size: 15px; }
+  .refresh-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+  .last-updated {
+    font-size: 12px;
+    color: var(--dim);
+  }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚙️ Micro-kernel <span>Dashboard</span></h1>
+  <div class="actions">
+    <label class="btn btn-primary" for="upload-input">⬆ Deploy Module</label>
+    <input type="file" id="upload-input" accept=".wasm" onchange="handleUpload(event)">
+    <button class="btn" onclick="refresh()">🔄 Refresh</button>
+  </div>
+</header>
+
+<div class="status-bar">
+  <div class="stat">
+    <div class="value" id="stat-total">0</div>
+    <div class="label">Total Modules</div>
+  </div>
+  <div class="stat">
+    <div class="value" id="stat-active">0</div>
+    <div class="label">Active Deployments</div>
+  </div>
+  <div class="stat">
+    <div class="value" id="stat-uptime">--</div>
+    <div class="label">Uptime</div>
+  </div>
+</div>
+
+<div class="refresh-bar">
+  <span style="font-size:14px;font-weight:600;">📦 Deployed Modules</span>
+  <span class="last-updated" id="last-updated">Last updated: --</span>
+</div>
+
+<div id="module-list">
+  <div class="empty-state">
+    <div class="icon">📭</div>
+    <p>No modules deployed yet.</p>
+    <p style="font-size:13px;margin-top:6px;">Upload a .wasm file or watch the ./modules folder.</p>
+  </div>
+</div>
+
+<script>
+const API = '/api/modules';
+
+async function refresh() {
+  try {
+    const res = await fetch(API);
+    const modules = await res.json();
+    renderModules(modules);
+    document.getElementById('last-updated').textContent =
+      'Last updated: ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function renderModules(modules) {
+  const list = document.getElementById('module-list');
+  document.getElementById('stat-total').textContent = modules.length;
+
+  let activeCount = 0;
+  modules.forEach(m => { if (m.blue || m.green) activeCount++; });
+  document.getElementById('stat-active').textContent = activeCount;
+
+  if (modules.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <div class="icon">📭</div>
+      <p>No modules deployed yet.</p>
+      <p style="font-size:13px;margin-top:6px;">Upload a .wasm file or watch the ./modules folder.</p>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = modules.map(m => {
+    const blue = m.blue || null;
+    const green = m.green || null;
+    const active = m.active_slot;
+
+    function slotHTML(label, slot, isActive) {
+      const cls = isActive ? 'slot active-slot' : 'slot';
+      if (!slot) {
+        return `<div class="${cls}">
+          <div class="slot-header"><span class="slot-label">${label}</span></div>
+          <div class="slot-empty">— empty —</div>
+        </div>`;
+      }
+      return `<div class="${cls}">
+        <div class="slot-header">
+          <span class="slot-label">${label} ${isActive ? '● LIVE' : ''}</span>
+          <span class="badge ${isActive ? 'badge-active' : ''}">${isActive ? 'active' : 'standby'}</span>
+        </div>
+        <div class="slot-version">v${slot.version}</div>
+        <div class="slot-time">deployed ${slot.deployed_at}</div>
+      </div>`;
+    }
+
+    return `<div class="module-card">
+      <div class="module-header">
+        <div class="module-name">
+          📁 ${m.name}
+          <span class="module-prefix">/${m.name}/*</span>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="swapModule('${m.name}')" ${!blue || !green ? 'disabled' : ''}>🔀 Swap</button>
+          <button class="btn btn-danger" onclick="removeModule('${m.name}')">🗑 Remove</button>
+        </div>
+      </div>
+      <div class="slots">
+        ${slotHTML('BLUE', blue, active === 'blue')}
+        ${slotHTML('GREEN', green, active === 'green')}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function swapModule(name) {
+  try {
+    const res = await fetch(`${API}/${name}/swap`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      console.log(`Swapped ${name} → active slot: ${data.active}`);
+      refresh();
+    } else {
+      alert(data.error);
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function removeModule(name) {
+  if (!confirm(`Delete module "${name}"? This removes both blue and green slots.`)) return;
+  try {
+    const res = await fetch(`${API}/${name}`, { method: 'DELETE' });
+    if (res.ok) {
+      refresh();
+    } else {
+      const data = await res.json();
+      alert(data.error);
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+async function handleUpload(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('module', file);
+  try {
+    const res = await fetch(`${API}/deploy`, { method: 'POST', body: form });
+    const data = await res.json();
+    if (res.ok) {
+      refresh();
+    } else {
+      alert(JSON.stringify(data));
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// Start
+refresh();
+setInterval(refresh, 5000);
+
+// Uptime counter
+const start = Date.now();
+setInterval(() => {
+  const s = Math.floor((Date.now() - start) / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  document.getElementById('stat-uptime').textContent =
+    `${h}h ${m % 60}m ${s % 60}s`;
+}, 1000);
+</script>
+
+</body>
+</html>
