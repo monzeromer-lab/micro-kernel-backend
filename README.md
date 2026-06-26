@@ -4,8 +4,6 @@ A **micro-kernel web backend** where the server core is minimal and all
 business logic lives in dynamically-loaded WebAssembly modules. Modules
 can be deployed, swapped, and rolled back without restarting the server.
 
-> Built for the talk **"Building a Backend in Micro-kernel Architecture"**.
-
 ---
 
 ## Prerequisites
