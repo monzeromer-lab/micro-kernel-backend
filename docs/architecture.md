@@ -2,187 +2,154 @@
 
 ## The Micro-kernel Concept
 
-A **micro-kernel** operating system has a tiny core that does only the bare minimum —
-memory management, process scheduling, IPC — and pushes everything else into
-user-space processes. This project applies the same idea to a web backend:
+```
+┌──────────────────────────────────────────────────────────┐
+│                        KERNEL                             │
+│                                                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐           │
+│  │  Actix   │  │ wasmtime │  │   Module     │           │
+│  │  HTTP    │  │  Engine  │  │   Registry   │           │
+│  └──────────┘  └──────────┘  └──────────────┘           │
+│                                                          │
+│  ┌──────────────────────────────────────────┐           │
+│  │          ServiceRegistry                  │           │
+│  │  ┌────────────────┐  ┌─────────────────┐ │           │
+│  │  │ Service Providers│  │ Module Exports  │ │           │
+│  │  │ postgres/main_db│  │ user::get_name  │ │           │
+│  │  │ http/default    │  │ order::get_info │ │           │
+│  │  │ redis/cache     │  │                 │ │           │
+│  │  └────────────────┘  └─────────────────┘ │           │
+│  └──────────────────────────────────────────┘           │
+│                                                          │
+│  The kernel ONLY does:                                   │
+│    • HTTP routing                                        │
+│    • WASM compilation & instantiation                    │
+│    • Module lifecycle (load/unload/swap)                 │
+│    • Service mediation (DB, HTTP, Redis)                 │
+│    • Inter-module communication                          │
+└──────────────────────────────────────────────────────────┘
+                          │
+            ┌─────────────┼──────────────┐
+            ▼             ▼              ▼
+       ┌────────┐   ┌────────┐    ┌──────────┐
+       │ user   │   │ order  │    │ payment  │
+       │ .wasm  │◄─►│ .wasm  │    │ .wasm    │
+       └───┬────┘   └────────┘    └──────────┘
+           │
+           ▼
+    ┌─────────────┐
+    │  Postgres   │   ← via kernel, never direct
+    └─────────────┘
+```
+
+## Data Flow: External Service Call
 
 ```
-┌─────────────────────────────────────────────────┐
-│                    KERNEL                        │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │  Actix   │  │ wasmtime │  │   Module      │  │
-│  │  HTTP    │  │  Engine  │  │   Registry    │  │
-│  └──────────┘  └──────────┘  └───────────────┘  │
-│                                                  │
-│  The kernel ONLY does:                           │
-│    • HTTP routing                                │
-│    • WASM compilation & instantiation            │
-│    • Module lifecycle (load/unload/swap)         │
-└─────────────────────────────────────────────────┘
-                        │
-          ┌─────────────┼─────────────┐
-          ▼             ▼             ▼
-     ┌────────┐   ┌────────┐   ┌────────┐
-     │ user.  │   │ order. │   │ payment│
-     │ wasm   │   │ wasm   │   │ .wasm  │
-     └────────┘   └────────┘   └────────┘
-
-     Each module is an independent WASM binary.
-     It registers its own routes, middleware, guards.
-     Modules don't know about each other.
+1. Module's handler runs:
+   call_service("postgres", "main_db", b"SELECT ...")
+         │
+2. Host callback executes (set during deploy):
+   svc_registry.call_service("postgres", "main_db", ...)
+         │
+3. ServiceRegistry looks up "postgres/main_db"
+   → finds PostgresProvider
+         │
+4. PostgresProvider.call(sql) runs
+   (in production: uses sqlx/tokio-postgres pool)
+         │
+5. Returns bytes → back to module → turned into Response
 ```
 
-## Data Flow (Request → Response)
+## Data Flow: Inter-Module Call
 
 ```
-1. HTTP Request arrives at Actix
+Module B calls call_module("user", "get_name", args)
          │
-2. Actix dispatches to matching route
+1. Host callback executes:
+   svc_registry.call_export("user", "get_name", args)
          │
-3. Route was registered by a WASM module (via ModuleContext)
+2. ServiceRegistry looks up "user::get_name"
+   → finds ExportEntry { module: Arc<dyn WasmModule>, function }
          │
-4. Handler runs:
-   - If native: closure returns Response immediately
-   - If WASM: host calls into wasmtime Func → guest code runs → returns via memory
+3. Calls module.on_export_call("get_name", args)
          │
-5. rayna_module::Response → converted to actix_web::HttpResponse
-         │
-6. Response sent to client
+4. Returns bytes → back to Module B
 ```
+
+Key insight: modules never see each other's memory. The host copies all data.
+For WASM modules, the host would call into `Module A`'s wasmtime instance,
+read the result from its memory, and copy it into `Module B`'s memory.
 
 ## Component Map
 
-### Two Crates (Workspace)
+### Three Crates
 
 | Crate | Purpose | Dependencies |
 |-------|---------|-------------|
-| `wasm-module` | The **contract** that module authors implement. Defines traits and data types. | Zero heavy deps. Only `std`. |
-| `wasm-server` | The **kernel** that loads and runs modules. Provides Actix server, wasmtime engine, dashboard. | `actix-web`, `wasmtime`, `notify`, `tokio` |
-
-### Why Two Crates?
-
-`wasm-module` is **publishable to crates.io** independently. A module author adds:
-
-```toml
-[dependencies]
-wasm-module = "0.1"
-```
-
-And implements the `WasmModule` trait — no need to pull in `actix-web` or `wasmtime`.
+| `wasm-module` | The **contract** — traits and types | Zero heavy deps |
+| `wasm-server` | The **kernel** — Actix + wasmtime + dashboard | actix-web, wasmtime, notify, tokio |
 
 ### Key Data Structures
 
-#### ModuleContext (in `wasm-module`)
+#### ModuleContext (`wasm-module`)
 
 ```rust
 pub struct ModuleContext {
-    routes: Vec<RouteDef>,        // GET /path → Handler
-    scopes: Vec<ScopeDef>,        // nested /prefix → sub-ModuleContext
+    routes: Vec<RouteDef>,
+    scopes: Vec<ScopeDef>,
     middleware: Vec<Box<dyn Middleware>>,
     guards: Vec<Box<dyn Guard>>,
+    exports: Vec<String>,
+
+    // Set by host before register() — call external services
+    pub call_service: Option<Arc<dyn Fn(&str, &str, &[u8]) -> Vec<u8>>>,
+    // Set by host before register() — call other modules
+    pub call_module: Option<Arc<dyn Fn(&str, &str, &[u8]) -> Vec<u8>>>,
 }
 ```
 
-Built by the module during `register()`. The kernel reads it and converts to Actix routes.
-
-#### ModuleRegistry (in `wasm-server`)
+#### ServiceRegistry (`wasm-server`)
 
 ```rust
-pub struct ModuleRegistry {
-    modules: HashMap<String, ModuleSlots>,
-}
-
-pub struct ModuleSlots {
-    pub active: String,           // "blue" or "green"
-    pub blue: Option<ModuleEntry>,
-    pub green: Option<ModuleEntry>,
+pub struct ServiceRegistry {
+    services: HashMap<String, Box<dyn ServiceProvider>>,  // "postgres/main_db"
+    exports: HashMap<String, ExportEntry>,                // "user::get_name"
 }
 ```
 
-Each module name maps to two deployment slots. Only the `active` slot serves traffic.
-
-### Trait Hierarchy
+## Trait Hierarchy (updated)
 
 ```
-WasmModule  ←── every module implements this
+WasmModule: Send + Sync  ←── every module implements this
     │
     ├── register(&self, ctx: &mut ModuleContext)
     │       │
-    │       ├── ctx.get(path, handler)
-    │       ├── ctx.post(path, handler)
-    │       ├── ctx.scope(prefix, |sub| { ... })
-    │       ├── ctx.middleware(mw)
-    │       └── ctx.guard(g)
+    │       ├── ctx.get/post/put/delete/patch  (routes)
+    │       ├── ctx.scope                      (nesting)
+    │       ├── ctx.export("name")             (inter-module exports)  ← NEW
+    │       ├── ctx.middleware / ctx.guard      (interceptors)
+    │       │
+    │       │  Module handlers can use:
+    │       ├── ctx.call_service("postgres", "main_db", sql)   ← NEW
+    │       └── ctx.call_module("user", "get_name", args)      ← NEW
     │
-    ├── properties() → ModuleProperties
-    │       memory_pages, max_memory_pages, memory64, consume_fuel
+    ├── properties(&self) → ModuleProperties
+    │       memory_pages, required_services, required_modules   ← NEW
     │
-    └── version() → (u16, u16, u16)
+    ├── version(&self) → (u16, u16, u16)
+    │
+    └── on_export_call(&self, function, args) → Vec<u8>        ← NEW
 
-Middleware  ←── request/response interceptors
-    ├── name() → &str
-    ├── before() → bool
-    └── after() → bool
-
-Guard  ←── conditional routing gates
-    ├── name() → &str
-    └── check() → bool
-
-Handler  ←── route callbacks
-    └── call() → Response
+ServiceProvider  ←── external service wrappers
+    └── call(&self, method, payload) → Vec<u8>
 ```
 
-## File Watcher (notify)
+## Service Providers (built-in demos)
 
-The watcher monitors `./modules/` for `.wasm` file changes using the `notify` crate:
+| Provider | Register as | What it does |
+|----------|------------|-------------|
+| `PostgresProvider` | `postgres/main_db` | Logs SQL, returns placeholder `{"rows":[]}` |
+| `HttpClientProvider` | `http/default` | Echoes back the request body |
+| `RedisProvider` | `redis/cache` | Logs command, returns `{"result":"ok"}` |
 
-```
-modules/
-├── user.wasm       ← detected → name = "user" → mount at /user/*
-├── product.wasm    ← detected → name = "product" → mount at /product/*
-```
-
-**Naming rules**: lowercase a–z only. No numbers, no special characters, no underscores.
-The filename stem becomes the URL prefix. `user.wasm` → `/user/...`.
-
-Events:
-- **Create** → module added (TODO: auto-compile & register)
-- **Modify** → module updated (TODO: auto-redeploy into inactive slot)
-- **Remove** → module removed from registry
-
-## wasmtime Engine Configuration
-
-The kernel creates a single `wasmtime::Engine` at startup with these defaults:
-
-```rust
-config.wasm_bulk_memory(true);     // efficient memory operations
-config.wasm_multi_value(true);     // multiple return values
-config.wasm_multi_memory(true);    // multiple memories
-config.wasm_reference_types(true); // externref/funcref
-config.wasm_simd(true);            // SIMD instructions
-config.cranelift_opt_level(Speed); // optimise for runtime speed
-config.epoch_interruption(true);   // can cancel runaway modules
-```
-
-Each module can override settings via `ModuleProperties` returned by `WasmModule::properties()`.
-
-## Actix Integration
-
-The `scope::mount_context()` function in `wasm-server` is the bridge:
-
-```rust
-pub fn mount_context(cfg: &mut web::ServiceConfig, ctx: &ModuleContext) {
-    for route in ctx.routes() {
-        match route.method {
-            Method::Get  → cfg.route(path, web::get().to(handler_closure)),
-            Method::Post → cfg.route(path, web::post().to(handler_closure)),
-            // ...
-        }
-    }
-    for scope in ctx.scopes() {
-        cfg.service(web::scope(prefix).configure(|inner| mount_context(inner, &scope.context)));
-    }
-}
-```
-
-It iterates every `RouteDef` in the `ModuleContext` and registers it with Actix's routing table.
+In production, these would be backed by real connection pools (`sqlx`, `reqwest`, `redis-rs`).

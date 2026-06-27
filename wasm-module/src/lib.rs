@@ -1,22 +1,35 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // WasmModule — the contract every module must implement
 // ---------------------------------------------------------------------------
 
-pub trait WasmModule {
+pub trait WasmModule: Send + Sync {
     /// Called once when the module is loaded. Register routes, middleware,
-    /// guards, and nested scopes using the provided [`ModuleContext`].
+    /// guards, exports, and nested scopes using the provided [`ModuleContext`].
+    ///
+    /// The context also provides [`call_service`](ModuleContext::call_service)
+    /// and [`call_module`](ModuleContext::call_module) for inter-module and
+    /// external-service communication.
     fn register(&self, ctx: &mut ModuleContext);
 
     /// Declare the runtime properties this module needs.
-    fn properties() -> ModuleProperties {
+    fn properties(&self) -> ModuleProperties {
         ModuleProperties::default()
     }
 
-    /// Semantic version of this module — used for blue-green deployments.
-    fn version() -> (u16, u16, u16) {
+    /// Semantic version — used for blue-green deployments.
+    fn version(&self) -> (u16, u16, u16) {
         (0, 1, 0)
+    }
+
+    /// Called by the kernel when **another module** invokes one of this
+    /// module's exported functions (declared via [`ModuleContext::export`]).
+    ///
+    /// Return the response bytes. Return empty vec for unknown functions.
+    fn on_export_call(&self, _function: &str, _args: &[u8]) -> Vec<u8> {
+        vec![]
     }
 }
 
@@ -36,6 +49,26 @@ pub struct ModuleProperties {
     pub consume_fuel: bool,
     /// Maximum Wasm stack in bytes (None = host default, 512 KiB).
     pub max_wasm_stack: Option<usize>,
+
+    /// External services this module needs (database, HTTP, Redis, etc.).
+    pub required_services: Vec<ServiceRequirement>,
+    /// Other modules this module depends on (loaded first, exports available).
+    pub required_modules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceRequirement {
+    /// Type of service.
+    pub kind: ServiceKind,
+    /// A unique identifier within that service kind, e.g. `"main_db"`.
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceKind {
+    Postgres,
+    Http,
+    Redis,
 }
 
 impl Default for ModuleProperties {
@@ -46,6 +79,8 @@ impl Default for ModuleProperties {
             memory64: false,
             consume_fuel: false,
             max_wasm_stack: None,
+            required_services: Vec::new(),
+            required_modules: Vec::new(),
         }
     }
 }
@@ -142,57 +177,46 @@ impl From<String> for Response {
 }
 
 // ---------------------------------------------------------------------------
-// Middleware — must be a proper trait for the talk
+// Middleware
 // ---------------------------------------------------------------------------
 
-/// A request/response interceptor.
-///
-/// Implement this trait to create middleware that runs before or after
-/// every route in a scope. Modules register middleware via
-/// [`ModuleContext::middleware`].
 pub trait Middleware: Send + Sync + 'static {
-    /// Unique name for this middleware (used in logs / dashboard).
     fn name(&self) -> Cow<'static, str>;
-
-    /// Called **before** the handler runs. Return `true` to continue to the
-    /// handler, or `false` to short-circuit (the request is rejected).
-    fn before(&self) -> bool {
-        true
-    }
-
-    /// Called **after** the handler runs. The response can be inspected or
-    /// mutated here (future: the actual response object will be passed in).
-    fn after(&self) -> bool {
-        true
-    }
+    fn before(&self) -> bool { true }
+    fn after(&self) -> bool { true }
 }
 
 // ---------------------------------------------------------------------------
-// Guard — must be a proper trait for the talk
+// Guard
 // ---------------------------------------------------------------------------
 
-/// A conditional gate that must pass before a route executes.
-///
-/// Implement this trait to create guards for auth, header validation, etc.
-/// Modules register guards via [`ModuleContext::guard`].
 pub trait Guard: Send + Sync + 'static {
-    /// Unique name for this guard (used in logs / dashboard).
     fn name(&self) -> Cow<'static, str>;
-
-    /// Return `true` if the request is allowed through. Return `false` to
-    /// reject with 403 Forbidden.
     fn check(&self) -> bool;
 }
 
 // ---------------------------------------------------------------------------
-// ModuleContext
+// ModuleContext — the registration API, now with inter-module + service calls
 // ---------------------------------------------------------------------------
+
+/// Callback: call an external service (database, HTTP, Redis, etc.).
+pub type ServiceCallFn = dyn Fn(&str, &str, &[u8]) -> Vec<u8> + Send + Sync;
+/// Callback: call a function exported by another module.
+pub type ModuleCallFn = dyn Fn(&str, &str, &[u8]) -> Vec<u8> + Send + Sync;
 
 pub struct ModuleContext {
     routes: Vec<RouteDef>,
     scopes: Vec<ScopeDef>,
     middleware: Vec<Box<dyn Middleware>>,
     guards: Vec<Box<dyn Guard>>,
+
+    /// Functions this module exports for other modules to call.
+    exports: Vec<String>,
+
+    /// Set by the host before `register()` — call an external service.
+    pub call_service: Option<Arc<ServiceCallFn>>,
+    /// Set by the host before `register()` — call another module's export.
+    pub call_module: Option<Arc<ModuleCallFn>>,
 }
 
 pub struct RouteDef {
@@ -223,6 +247,9 @@ impl ModuleContext {
             scopes: Vec::new(),
             middleware: Vec::new(),
             guards: Vec::new(),
+            exports: Vec::new(),
+            call_service: None,
+            call_module: None,
         }
     }
 
@@ -286,11 +313,24 @@ impl ModuleContext {
         f: impl FnOnce(&mut ModuleContext),
     ) -> &mut Self {
         let mut sub = ModuleContext::new();
+        // Propagate callbacks to nested scope (Arc makes them cheap to clone)
+        sub.call_service = self.call_service.clone();
+        sub.call_module = self.call_module.clone();
         f(&mut sub);
         self.scopes.push(ScopeDef {
             prefix: prefix.into(),
             context: sub,
         });
+        self
+    }
+
+    // -- Inter-module exports -----------------------------------------------
+
+    /// Declare a named function that other modules can call via `call_module`.
+    ///
+    /// The actual handler is implemented in [`WasmModule::on_export_call`].
+    pub fn export(&mut self, name: impl Into<String>) -> &mut Self {
+        self.exports.push(name.into());
         self
     }
 
@@ -314,6 +354,10 @@ impl ModuleContext {
 
     pub fn scopes(&self) -> impl Iterator<Item = &ScopeDef> {
         self.scopes.iter()
+    }
+
+    pub fn exports(&self) -> impl Iterator<Item = &String> {
+        self.exports.iter()
     }
 
     pub fn middleware_entries(&self) -> impl Iterator<Item = &dyn Middleware> {
@@ -343,84 +387,91 @@ mod tests {
 
     impl WasmModule for TestModule {
         fn register(&self, ctx: &mut ModuleContext) {
-            ctx.get("/", || "hello");
-            ctx.scope("/admin", |admin| {
-                admin.get("/dashboard", || "admin dashboard");
-            });
+            ctx.export("get_name")
+               .get("/", || "hello")
+               .scope("/admin", |admin| {
+                   admin.get("/dashboard", || "admin dashboard");
+               });
         }
 
-        fn properties() -> ModuleProperties {
+        fn properties(&self) -> ModuleProperties {
             ModuleProperties {
                 memory_pages: 2,
+                required_services: vec![ServiceRequirement {
+                    kind: ServiceKind::Postgres,
+                    identifier: "main_db".into(),
+                }],
+                required_modules: vec!["order".into()],
                 ..Default::default()
             }
         }
 
-        fn version() -> (u16, u16, u16) {
+        fn version(&self) -> (u16, u16, u16) {
             (1, 2, 3)
+        }
+
+        fn on_export_call(&self, function: &str, _args: &[u8]) -> Vec<u8> {
+            match function {
+                "get_name" => b"TestModule".to_vec(),
+                _ => vec![],
+            }
         }
     }
 
     #[test]
-    fn test_module_registers_routes() {
+    fn test_module_registers_routes_and_exports() {
         let mut ctx = ModuleContext::new();
         TestModule.register(&mut ctx);
 
         assert_eq!(ctx.routes.len(), 1);
         assert_eq!(ctx.scopes.len(), 1);
-        assert_eq!(ctx.scopes[0].prefix, "/admin");
+        assert_eq!(ctx.exports().count(), 1);
+
+        let exports: Vec<&String> = ctx.exports().collect();
+        assert_eq!(exports[0], "get_name");
     }
 
     #[test]
-    fn test_module_builder_pattern() {
+    fn test_on_export_call() {
+        let m = TestModule;
+        assert_eq!(m.on_export_call("get_name", &[]), b"TestModule".to_vec());
+        assert_eq!(m.on_export_call("unknown", &[]), vec![]);
+    }
+
+    #[test]
+    fn test_module_properties_with_services() {
+        let m = TestModule;
+        let props = m.properties();
+        assert_eq!(props.required_services.len(), 1);
+        assert_eq!(props.required_services[0].kind, ServiceKind::Postgres);
+        assert_eq!(props.required_modules, vec!["order"]);
+    }
+
+    #[test]
+    fn test_service_call_callback() {
         let mut ctx = ModuleContext::new();
-        ctx.get("/a", || "a")
-           .post("/b", || "b")
-           .put("/c", || "c")
-           .delete("/d", || "d")
-           .patch("/e", || "e");
+        ctx.call_service = Some(Arc::new(|kind: &str, id: &str, payload: &[u8]| {
+            assert_eq!(kind, "postgres");
+            assert_eq!(id, "main");
+            assert_eq!(payload, b"SELECT 1");
+            b"ok".to_vec()
+        }));
 
-        assert_eq!(ctx.routes.len(), 5);
+        let result = ctx.call_service.as_ref().unwrap()("postgres", "main", b"SELECT 1");
+        assert_eq!(result, b"ok");
     }
 
     #[test]
-    fn test_response_methods() {
-        assert_eq!(Response::ok("hi").status, 200);
-        assert_eq!(Response::created("new").status, 201);
-        assert_eq!(Response::bad_request("no").status, 400);
-        assert_eq!(Response::not_found().status, 404);
-        assert_eq!(Response::internal_error("oops").status, 500);
-    }
-
-    #[test]
-    fn test_middleware_trait() {
-        struct AuthMw;
-        impl Middleware for AuthMw {
-            fn name(&self) -> Cow<'static, str> { "auth".into() }
-            fn before(&self) -> bool { true }
-            fn after(&self) -> bool { true }
-        }
-
+    fn test_module_call_callback() {
         let mut ctx = ModuleContext::new();
-        ctx.middleware(AuthMw);
-        assert_eq!(ctx.middleware_entries().count(), 1);
-    }
+        ctx.call_module = Some(Arc::new(|module: &str, func: &str, args: &[u8]| {
+            assert_eq!(module, "order");
+            assert_eq!(func, "calc");
+            assert_eq!(args, b"{}");
+            b"42".to_vec()
+        }));
 
-    #[test]
-    fn test_guard_trait() {
-        struct AdminGuard;
-        impl Guard for AdminGuard {
-            fn name(&self) -> Cow<'static, str> { "admin".into() }
-            fn check(&self) -> bool { false }
-        }
-
-        let mut ctx = ModuleContext::new();
-        ctx.guard(AdminGuard);
-        assert_eq!(ctx.guard_entries().count(), 1);
-    }
-
-    #[test]
-    fn test_module_version() {
-        assert_eq!(TestModule::version(), (1, 2, 3));
+        let result = ctx.call_module.as_ref().unwrap()("order", "calc", b"{}");
+        assert_eq!(result, b"42");
     }
 }

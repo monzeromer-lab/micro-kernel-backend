@@ -1,12 +1,12 @@
 //! Module Registry — holds all loaded WASM modules and their routing info.
 //!
-//! Supports blue-green deployment: each module has `blue` and `green` slots.
-//! Only the `active` slot serves traffic. The dashboard swaps them atomically.
+//! Supports blue-green deployment and stores module instances so exports
+//! can be called by other modules via the [`ServiceRegistry`](super::services::ServiceRegistry).
 
 use actix_web::web;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wasm_module::ModuleContext;
+use wasm_module::{ModuleContext, WasmModule};
 
 use super::scope;
 
@@ -19,22 +19,18 @@ pub struct ModuleRegistry {
     modules: HashMap<String, ModuleSlots>,
 }
 
-/// A module's blue-green deployment slots.
 pub struct ModuleSlots {
-    /// The currently-active slot name: `"blue"` or `"green"`.
     pub active: String,
-    /// The blue slot — may be empty.
     pub blue: Option<ModuleEntry>,
-    /// The green slot — may be empty.
     pub green: Option<ModuleEntry>,
 }
 
-/// A deployed version of a module.
 pub struct ModuleEntry {
     pub version: (u16, u16, u16),
     pub ctx: Arc<ModuleContext>,
-    /// When this entry was deployed (for dashboard display).
     pub deployed_at: String,
+    /// The module instance — used to call exports via [`WasmModule::on_export_call`].
+    pub module: Option<Arc<dyn WasmModule>>,
 }
 
 impl ModuleRegistry {
@@ -46,15 +42,12 @@ impl ModuleRegistry {
 
     // -- Blue-green deployment --------------------------------------------
 
-    /// Deploy a module into the **inactive** slot. If no slots exist yet,
-    /// deploys into `blue` and marks it active.
-    ///
-    /// Returns `(slot_name, was_swapped)`.
     pub fn deploy(
         &mut self,
         name: impl Into<String>,
         ctx: ModuleContext,
         version: (u16, u16, u16),
+        module: Option<Arc<dyn WasmModule>>,
     ) -> (&str, bool) {
         let name = name.into();
         let now = chrono_now();
@@ -63,6 +56,7 @@ impl ModuleRegistry {
             version,
             ctx: Arc::new(ctx),
             deployed_at: now,
+            module,
         };
 
         let slots = self.modules.entry(name).or_insert_with(|| ModuleSlots {
@@ -71,7 +65,6 @@ impl ModuleRegistry {
             green: None,
         });
 
-        // Deploy to the inactive slot
         let target = if slots.active == "blue" { "green" } else { "blue" };
         match target {
             "blue" => slots.blue = Some(entry),
@@ -79,12 +72,10 @@ impl ModuleRegistry {
             _ => unreachable!(),
         }
 
-        // Auto-activate on first deploy
         let swapped = if slots.active != target
             && slots.green.is_some()
             && slots.blue.is_some()
         {
-            // Both slots are populated — perform the swap
             slots.active = target.to_string();
             true
         } else if slots.blue.is_some() && slots.green.is_none() && slots.active != "blue" {
@@ -100,12 +91,10 @@ impl ModuleRegistry {
         (target, swapped)
     }
 
-    /// Swap the active slot (blue ↔ green). No-op if the inactive slot is empty.
     pub fn swap(&mut self, name: &str) -> Option<&str> {
         let slots = self.modules.get_mut(name)?;
         let new_active = if slots.active == "blue" { "green" } else { "blue" };
 
-        // Only swap if the other slot has a module
         let has_other = match new_active {
             "blue" => slots.blue.is_some(),
             "green" => slots.green.is_some(),
@@ -120,14 +109,12 @@ impl ModuleRegistry {
         }
     }
 
-    /// Remove a module entirely (both slots).
     pub fn remove(&mut self, name: &str) -> bool {
         self.modules.remove(name).is_some()
     }
 
     // -- Accessors --------------------------------------------------------
 
-    /// Get the **active** context for a module (used by the router).
     pub fn active_ctx(&self, name: &str) -> Option<&Arc<ModuleContext>> {
         let slots = self.modules.get(name)?;
         match slots.active.as_str() {
@@ -137,7 +124,16 @@ impl ModuleRegistry {
         }
     }
 
-    /// Mount all active modules onto an Actix [`ServiceConfig`].
+    /// Get the active module instance (for export calls).
+    pub fn active_module(&self, name: &str) -> Option<Arc<dyn WasmModule>> {
+        let slots = self.modules.get(name)?;
+        match slots.active.as_str() {
+            "blue" => slots.blue.as_ref().and_then(|e| e.module.clone()),
+            "green" => slots.green.as_ref().and_then(|e| e.module.clone()),
+            _ => None,
+        }
+    }
+
     pub fn configure_all(&self, cfg: &mut web::ServiceConfig) {
         let mut names: Vec<&String> = self.modules.keys().collect();
         names.sort();
@@ -153,7 +149,7 @@ impl ModuleRegistry {
         }
     }
 
-    // -- Dashboard API data -----------------------------------------------
+    // -- Dashboard ---------------------------------------------------------
 
     pub fn len(&self) -> usize {
         self.modules.len()
@@ -163,7 +159,6 @@ impl ModuleRegistry {
         self.modules.is_empty()
     }
 
-    /// Return all modules with their blue/green status for the dashboard.
     pub fn snapshot(&self) -> Vec<ModuleSnapshot> {
         let mut names: Vec<&String> = self.modules.keys().collect();
         names.sort();
@@ -190,7 +185,7 @@ impl ModuleRegistry {
 }
 
 // ---------------------------------------------------------------------------
-// Dashboard data types
+// Dashboard types
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize)]
@@ -212,7 +207,6 @@ pub struct SlotSnapshot {
 // ---------------------------------------------------------------------------
 
 fn chrono_now() -> String {
-    // Simple timestamp for the demo — no chrono dependency needed.
     use std::time::SystemTime;
     if let Ok(dur) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
         let secs = dur.as_secs();

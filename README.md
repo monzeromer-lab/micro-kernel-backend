@@ -1,8 +1,10 @@
 # Micro-kernel Architecture — Tech Talk Demo
 
-A **micro-kernel web backend** where the server core is minimal and all
-business logic lives in dynamically-loaded WebAssembly modules. Modules
-can be deployed, swapped, and rolled back without restarting the server.
+A **micro-kernel web backend** where the server core is minimal and all business
+logic lives in dynamically-loaded WebAssembly modules. Modules can be deployed,
+swapped, rolled back, call external services, and call each other.
+
+> Built for the talk **"Building a Backend in Micro-kernel Architecture"**.
 
 ---
 
@@ -13,8 +15,6 @@ can be deployed, swapped, and rolled back without restarting the server.
 | Rust | 1.85+ (edition 2024) | `rustc --version` |
 | WASM target | `wasm32-unknown-unknown` | `rustup target list --installed` |
 
-### Install the WASM target
-
 ```bash
 rustup target add wasm32-unknown-unknown
 ```
@@ -23,117 +23,61 @@ rustup target add wasm32-unknown-unknown
 
 ## Getting Started
 
-### 1. Clone and build
+### 1. Build and run
 
 ```bash
-git clone <repo-url>
-cd wasm
 cargo build
-```
-
-### 2. Start the server
-
-```bash
 cargo run
 ```
 
-The server starts on **`http://localhost:8080`** and prints:
+The server starts on **`http://localhost:8080`**:
 
 ```
 ╔══════════════════════════════════════════════╗
 ║  Micro-kernel Architecture — Tech Talk Demo ║
 ╠══════════════════════════════════════════════╣
 ║  /wasm/              — example routes       ║
+║  /user/*             — user module          ║
+║  /order/*            — order module         ║
 ║  /dashboard          — module dashboard     ║
-║  /api/modules        — dashboard API        ║
-║  Module folder: ./modules/                  ║
+║  /api/...            — dashboard API        ║
 ╚══════════════════════════════════════════════╝
-[kernel] wasmtime engine ready
-[watcher] watching ./modules/ for .wasm files...
 ```
 
-### 3. Open the dashboard
+### 2. Open the dashboard
 
 ```
 http://localhost:8080/dashboard
 ```
 
-### 4. Test the example endpoints
+### 3. Test the endpoints
 
 ```bash
-curl http://localhost:8080/wasm/
-# → "Hello from the dynamic scope!"
+# Example scope
+curl http://localhost:8080/wasm/health          # → {"status":"ok"}
 
-curl http://localhost:8080/wasm/health
-# → {"status":"ok"}
+# User module
+curl http://localhost:8080/user/                # → "User Module"
+curl http://localhost:8080/user/list            # → calls Postgres via kernel
+curl http://localhost:8080/user/from-order      # → calls Order module
+
+# Order module
+curl http://localhost:8080/order/               # → "Order Module"
+curl http://localhost:8080/order/call-user      # → calls User module
 ```
 
 ---
 
-## Creating a Module
+## Key Features
 
-### 1. Add the dependency
-
-```toml
-# your-module/Cargo.toml
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-wasm-module = "0.1"
-```
-
-### 2. Implement the trait
-
-```rust
-use wasm_module::{WasmModule, ModuleContext, Response};
-
-struct MyModule;
-
-impl WasmModule for MyModule {
-    fn register(&self, ctx: &mut ModuleContext) {
-        ctx.get("/", || Response::ok("Hello from my module!"));
-        ctx.get("/data", || Response::json(b"[1,2,3]".to_vec()));
-    }
-}
-```
-
-### 3. Compile to WASM
-
-```bash
-cargo build --target wasm32-unknown-unknown --release
-```
-
-### 4. Deploy
-
-Drop the `.wasm` file into the `modules/` folder:
-
-```bash
-cp target/wasm32-unknown-unknown/release/my_module.wasm ./modules/
-```
-
-The file watcher detects it. The module's name is taken from the filename
-stem (e.g. `my_module.wasm` → mounted at `/my_module/...`).
-
-> **Naming rules**: lowercase a–z only. No numbers, no special characters.
-> `user.wasm` ✓ — `user_api.wasm` ✗ — `User.wasm` ✗ — `user1.wasm` ✗
-
----
-
-## Dashboard
-
-```
-http://localhost:8080/dashboard
-```
-
-| Feature | How |
-|---------|-----|
-| **View modules** | See all deployed modules with blue/green slot status |
-| **Deploy** | Click "Deploy Module" → select a `.wasm` file |
-| **Swap** | Click "Swap" to instantly switch blue ↔ green |
-| **Remove** | Click "Remove" to delete a module |
-
-See [docs/dashboard.md](docs/dashboard.md) for the full UI guide.
+| Feature | For the talk |
+|---------|-------------|
+| Dynamic module loading | Drop `.wasm` in `modules/`, watcher picks it up |
+| Blue-green deployment | Dashboard — deploy v2, Swap, instant rollback |
+| Inter-module calls | `/user/from-order` and `/order/call-user` |
+| External services | `/user/list` calls Postgres through kernel |
+| Middleware + Guards | Built into the `WasmModule` trait |
+| Graceful shutdown | Dashboard → Server Control |
 
 ---
 
@@ -147,30 +91,28 @@ wasm/
 │   ├── README.md
 │   ├── architecture.md     # Inner workings, data flow
 │   ├── modules.md          # Module creation guide
+│   ├── services.md         # Adding external services
 │   ├── dashboard.md        # Dashboard UI guide
 │   ├── api.md              # REST API reference
 │   └── blue-green.md       # Deployment mechanism deep dive
 ├── modules/                # Drop .wasm files here
 │
-├── wasm-module/            # The module SDK crate (publishable)
+├── wasm-module/            # Module SDK crate (publishable)
 │   ├── Cargo.toml
 │   ├── README.md
-│   └── src/lib.rs          # WasmModule, ModuleContext, Response, etc.
+│   └── src/lib.rs
 │
-└── server/                 # The micro-kernel runtime
+└── server/                 # Micro-kernel runtime
     ├── Cargo.toml
-    ├── static/
-    │   └── dashboard.html
+    ├── static/dashboard.html
     └── src/
         ├── main.rs
         ├── dashboard.rs
         ├── scope.rs
         ├── registry.rs
+        ├── services.rs       # ServiceRegistry
         ├── watcher.rs
         └── engine/
-            ├── mod.rs
-            ├── wasm_config.rs
-            └── host_funcs.rs
 ```
 
 ---
@@ -179,15 +121,13 @@ wasm/
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/api/modules` | List all modules (blue/green status) |
-| `POST` | `/api/modules/deploy` | Upload a `.wasm` module |
-| `POST` | `/api/modules/{name}/swap` | Swap blue ↔ green |
-| `DELETE` | `/api/modules/{name}` | Remove a module |
-| `GET` | `/dashboard` | Dashboard HTML UI |
-| `GET` | `/wasm/` | Example route |
-| `GET` | `/wasm/health` | Health check |
-
-See [docs/api.md](docs/api.md) for full API reference with curl examples.
+| `GET` | `/api/modules` | List modules (blue/green) |
+| `POST` | `/api/modules/deploy` | Upload `.wasm` |
+| `POST` | `/api/modules/{name}/swap` | Blue-green swap |
+| `DELETE` | `/api/modules/{name}` | Remove module |
+| `POST` | `/api/shutdown/graceful` | Graceful shutdown |
+| `POST` | `/api/shutdown/force` | Force shutdown |
+| `GET` | `/dashboard` | Dashboard UI |
 
 ---
 
@@ -198,6 +138,7 @@ docs/
 ├── README.md           # Overview & quick start
 ├── architecture.md     # How the kernel works
 ├── modules.md          # Writing modules (full API reference)
+├── services.md         # Adding DB, HTTP, Redis, custom providers
 ├── dashboard.md        # Using the dashboard
 ├── api.md              # REST API endpoints
 └── blue-green.md       # Blue-green deployment deep dive
@@ -205,6 +146,21 @@ docs/
 
 ---
 
-## License
+## Creating a Module
 
-MIT OR Apache-2.0 — this is a tech talk demo.
+```rust
+use wasm_module::{WasmModule, ModuleContext, Response};
+
+struct MyModule;
+impl WasmModule for MyModule {
+    fn register(&self, ctx: &mut ModuleContext) {
+        ctx.export("hello")
+           .get("/", || Response::ok("Hello!"));
+    }
+    fn on_export_call(&self, f: &str, _: &[u8]) -> Vec<u8> {
+        match f { "hello" => b"Hello from module".to_vec(), _ => vec![] }
+    }
+}
+```
+
+See [docs/modules.md](docs/modules.md) for the full guide.

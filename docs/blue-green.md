@@ -13,9 +13,10 @@ pub struct ModuleSlots {
 }
 
 pub struct ModuleEntry {
-    pub version: (u16, u16, u16),     // semver
-    pub ctx: Arc<ModuleContext>,       // route definitions
-    pub deployed_at: String,          // timestamp
+    pub version: (u16, u16, u16),          // semver
+    pub ctx: Arc<ModuleContext>,            // route definitions
+    pub deployed_at: String,               // timestamp
+    pub module: Option<Arc<dyn WasmModule>>, // for inter-module exports
 }
 ```
 
