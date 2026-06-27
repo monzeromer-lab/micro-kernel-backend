@@ -102,14 +102,13 @@ impl WasmModule for UserModule {
         // -- Routes --
         ctx.get("/", || Response::ok("User Module Root"))
            .get("/list", move || {
-               // Call the Postgres service through the kernel
-               let result = if let Some(ref f) = call_svc {
-                   f("postgres", "main_db", b"SELECT id, name FROM users")
-               } else {
-                   b"{\"error\":\"no service\"}".to_vec()
-               };
-               Response::json(result)
-           })
+               ctx.get("/users", move || {
+                   // Typed Postgres query — no raw bytes, no manual parsing
+                   let rows = pg.as_ref().unwrap()
+                       .query("SELECT id, name FROM users WHERE active = true")
+                       .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+                   Response::json(rows.into_bytes())
+               })
            .get("/from-order", move || {
                // Call the Order module's exported function
                let result = if let Some(ref f) = call_mod {

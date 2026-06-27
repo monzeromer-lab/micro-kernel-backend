@@ -69,6 +69,8 @@ pub enum ServiceKind {
     Postgres,
     Http,
     Redis,
+    MySql,
+    S3,
 }
 
 impl Default for ModuleProperties {
@@ -177,6 +179,143 @@ impl From<String> for Response {
 }
 
 // ---------------------------------------------------------------------------
+// FromModuleBytes — typed inter-module / service responses
+// ---------------------------------------------------------------------------
+
+/// Trait for types that can be parsed from raw module/service call responses.
+///
+/// # Built-in impls (zero deps)
+///
+/// | Type | How it parses |
+/// |------|---------------|
+/// | `Vec<u8>` | Identity (no parsing) |
+/// | `String` | UTF-8 decode |
+/// | `i32`, `u32`, `i64`, `u64`, `f64`, `bool` | Parses from UTF-8 string |
+///
+/// # JSON support (enable `json` feature)
+///
+/// With `features = ["json"]`, any type implementing `serde::Deserialize`
+/// gets a blanket impl.  The raw bytes are parsed as JSON.
+///
+/// # Custom impl
+///
+/// ```rust,ignore
+/// struct MyType { value: i32 }
+/// impl FromModuleBytes for MyType {
+///     fn from_module_bytes(bytes: &[u8]) -> Result<Self, String> {
+///         // your parsing logic here
+///     }
+/// }
+/// ```
+pub trait FromModuleBytes: Sized {
+    fn from_module_bytes(bytes: &[u8]) -> Result<Self, String>;
+}
+
+// -- Built-in impls (no serde needed) ---------------------------------------
+
+impl FromModuleBytes for Vec<u8> {
+    fn from_module_bytes(bytes: &[u8]) -> Result<Self, String> {
+        Ok(bytes.to_vec())
+    }
+}
+
+impl FromModuleBytes for String {
+    fn from_module_bytes(bytes: &[u8]) -> Result<Self, String> {
+        String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+    }
+}
+
+macro_rules! impl_from_bytes_parse {
+    ($ty:ty) => {
+        impl FromModuleBytes for $ty {
+            fn from_module_bytes(bytes: &[u8]) -> Result<Self, String> {
+                let s = String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())?;
+                s.trim().parse::<$ty>().map_err(|e| e.to_string())
+            }
+        }
+    };
+}
+
+impl_from_bytes_parse!(i32);
+impl_from_bytes_parse!(u32);
+impl_from_bytes_parse!(i64);
+impl_from_bytes_parse!(u64);
+impl_from_bytes_parse!(f64);
+impl_from_bytes_parse!(bool);
+
+// -- JSON blanket impl (behind "json" feature) -----------------------------
+
+#[cfg(feature = "json")]
+impl<T> FromModuleBytes for T
+where
+    T: serde::de::DeserializeOwned,
+{
+    fn from_module_bytes(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed Service Handles — ergonomic, method-based access to external services
+// ---------------------------------------------------------------------------
+
+/// Typed handle for Postgres — modules call `.query()` / `.execute()`
+/// instead of raw `call_service("postgres", ...)`.
+pub trait PostgresHandle: Send + Sync {
+    /// Run a SELECT-style query. Returns JSON rows as a String.
+    fn query(&self, sql: &str) -> Result<String, String>;
+    /// Run INSERT / UPDATE / DELETE. Returns rows-affected count.
+    fn execute(&self, sql: &str) -> Result<u64, String>;
+    /// Run a parameterised query ($1, $2, ...).
+    fn query_with(&self, sql: &str, params: &[&str]) -> Result<String, String>;
+}
+
+/// Typed handle for Redis — modules call `.get()` / `.set()` / etc.
+pub trait RedisHandle: Send + Sync {
+    /// Get a key. `Ok(None)` means the key doesn't exist.
+    fn get(&self, key: &str) -> Result<Option<String>, String>;
+    /// Set a key with optional TTL in seconds.
+    fn set(&self, key: &str, value: &str, ttl_seconds: Option<u64>) -> Result<(), String>;
+    /// Delete one or more keys. Returns the count of keys deleted.
+    fn del(&self, keys: &[&str]) -> Result<u64, String>;
+    /// Increment a key by 1 (or by `amount`). Returns the new value.
+    fn incr(&self, key: &str, amount: Option<i64>) -> Result<i64, String>;
+    /// Check if a key exists.
+    fn exists(&self, key: &str) -> Result<bool, String>;
+}
+
+/// Typed handle for MySQL — same shape as Postgres, separate trait for clarity.
+pub trait MySqlHandle: Send + Sync {
+    fn query(&self, sql: &str) -> Result<String, String>;
+    fn execute(&self, sql: &str) -> Result<u64, String>;
+    fn query_with(&self, sql: &str, params: &[&str]) -> Result<String, String>;
+}
+
+/// Typed handle for S3-compatible object storage.
+pub trait S3Handle: Send + Sync {
+    /// Put an object into a bucket. Returns the object key on success.
+    fn put(&self, bucket: &str, key: &str, data: &[u8]) -> Result<String, String>;
+    /// Get an object from a bucket. Returns the raw bytes.
+    fn get(&self, bucket: &str, key: &str) -> Result<Vec<u8>, String>;
+    /// Delete an object. Returns true if it existed.
+    fn delete(&self, bucket: &str, key: &str) -> Result<bool, String>;
+    /// List objects in a bucket with an optional prefix filter.
+    fn list(&self, bucket: &str, prefix: Option<&str>) -> Result<String, String>;
+}
+
+/// Typed handle for HTTP client.
+pub trait HttpHandle: Send + Sync {
+    /// GET a URL. Returns the response body.
+    fn get(&self, url: &str) -> Result<String, String>;
+    /// POST to a URL with a body. Returns the response body.
+    fn post(&self, url: &str, body: &str) -> Result<String, String>;
+    /// PUT to a URL with a body.
+    fn put(&self, url: &str, body: &str) -> Result<String, String>;
+    /// DELETE a URL.
+    fn delete(&self, url: &str) -> Result<String, String>;
+}
+
+// ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
 
@@ -213,10 +352,24 @@ pub struct ModuleContext {
     /// Functions this module exports for other modules to call.
     exports: Vec<String>,
 
-    /// Set by the host before `register()` — call an external service.
+    /// Set by the host before `register()` — call an external service (raw).
     pub call_service: Option<Arc<ServiceCallFn>>,
-    /// Set by the host before `register()` — call another module's export.
+    /// Set by the host before `register()` — call another module's export (raw).
     pub call_module: Option<Arc<ModuleCallFn>>,
+
+    // ── Typed service handles (set by host) ────────────────────────────────
+
+    /// Typed Postgres access. Set by host if module declares
+    /// `required_services` with `ServiceKind::Postgres`.
+    pub postgres: Option<Arc<dyn PostgresHandle>>,
+    /// Typed Redis access.
+    pub redis: Option<Arc<dyn RedisHandle>>,
+    /// Typed MySQL access.
+    pub mysql: Option<Arc<dyn MySqlHandle>>,
+    /// Typed S3 access.
+    pub s3: Option<Arc<dyn S3Handle>>,
+    /// Typed HTTP client access.
+    pub http: Option<Arc<dyn HttpHandle>>,
 }
 
 pub struct RouteDef {
@@ -250,6 +403,11 @@ impl ModuleContext {
             exports: Vec::new(),
             call_service: None,
             call_module: None,
+            postgres: None,
+            redis: None,
+            mysql: None,
+            s3: None,
+            http: None,
         }
     }
 
@@ -313,9 +471,14 @@ impl ModuleContext {
         f: impl FnOnce(&mut ModuleContext),
     ) -> &mut Self {
         let mut sub = ModuleContext::new();
-        // Propagate callbacks to nested scope (Arc makes them cheap to clone)
+        // Propagate callbacks and handles to nested scope
         sub.call_service = self.call_service.clone();
         sub.call_module = self.call_module.clone();
+        sub.postgres = self.postgres.clone();
+        sub.redis = self.redis.clone();
+        sub.mysql = self.mysql.clone();
+        sub.s3 = self.s3.clone();
+        sub.http = self.http.clone();
         f(&mut sub);
         self.scopes.push(ScopeDef {
             prefix: prefix.into(),
@@ -332,6 +495,59 @@ impl ModuleContext {
     pub fn export(&mut self, name: impl Into<String>) -> &mut Self {
         self.exports.push(name.into());
         self
+    }
+
+    // -- Typed inter-module & service calls ----------------------------------
+
+    /// Call another module's exported function and parse the response
+    /// into the requested type `T` via [`FromModuleBytes`].
+    ///
+    /// ```rust,ignore
+    /// let name: String = ctx.call_module_typed("user", "get_name", b"{}")?;
+    /// let count: i32  = ctx.call_module_typed("order", "count", b"{}")?;
+    ///
+    /// // With the `json` feature enabled:
+    /// #[derive(Deserialize)]
+    /// struct User { id: u32, name: String }
+    /// let user: User = ctx.call_module_typed("user", "get_user", b"{}")?;
+    /// ```
+    pub fn call_module_typed<T: FromModuleBytes>(
+        &self,
+        module: &str,
+        function: &str,
+        args: &[u8],
+    ) -> Result<T, String> {
+        let f = self
+            .call_module
+            .as_ref()
+            .ok_or_else(|| "call_module callback not set by host".to_string())?;
+        let bytes = f(module, function, args);
+        T::from_module_bytes(&bytes)
+    }
+
+    /// Call an external service and parse the response into type `T`
+    /// via [`FromModuleBytes`].
+    ///
+    /// ```rust,ignore
+    /// let rows: String = ctx.call_service_typed("postgres", "main_db", b"SELECT 1")?;
+    ///
+    /// // With the `json` feature:
+    /// #[derive(Deserialize)]
+    /// struct QueryResult { rows: Vec<Row> }
+    /// let result: QueryResult = ctx.call_service_typed("postgres", "main_db", sql)?;
+    /// ```
+    pub fn call_service_typed<T: FromModuleBytes>(
+        &self,
+        kind: &str,
+        identifier: &str,
+        payload: &[u8],
+    ) -> Result<T, String> {
+        let f = self
+            .call_service
+            .as_ref()
+            .ok_or_else(|| "call_service callback not set by host".to_string())?;
+        let bytes = f(kind, identifier, payload);
+        T::from_module_bytes(&bytes)
     }
 
     // -- Middleware & Guards ------------------------------------------------
@@ -473,5 +689,88 @@ mod tests {
 
         let result = ctx.call_module.as_ref().unwrap()("order", "calc", b"{}");
         assert_eq!(result, b"42");
+    }
+
+    // -- FromModuleBytes tests -----------------------------------------------
+
+    #[test]
+    fn test_from_bytes_vec_u8() {
+        let v: Vec<u8> = FromModuleBytes::from_module_bytes(b"hello").unwrap();
+        assert_eq!(v, b"hello");
+    }
+
+    #[test]
+    fn test_from_bytes_string() {
+        let s: String = FromModuleBytes::from_module_bytes(b"hello world").unwrap();
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn test_from_bytes_i32() {
+        let n: i32 = FromModuleBytes::from_module_bytes(b"42").unwrap();
+        assert_eq!(n, 42);
+    }
+
+    #[test]
+    fn test_from_bytes_f64() {
+        let n: f64 = FromModuleBytes::from_module_bytes(b"3.14").unwrap();
+        assert!((n - 3.14).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_from_bytes_bool() {
+        let b: bool = FromModuleBytes::from_module_bytes(b"true").unwrap();
+        assert!(b);
+        let b: bool = FromModuleBytes::from_module_bytes(b"false").unwrap();
+        assert!(!b);
+    }
+
+    #[test]
+    fn test_from_bytes_invalid_number() {
+        let result: Result<i32, _> = FromModuleBytes::from_module_bytes(b"not a number");
+        assert!(result.is_err());
+    }
+
+    // -- Typed call tests -----------------------------------------------------
+
+    #[test]
+    fn test_call_module_typed_string() {
+        let mut ctx = ModuleContext::new();
+        ctx.call_module = Some(Arc::new(|_: &str, _: &str, _: &[u8]| {
+            b"Alice".to_vec()
+        }));
+
+        let name: String = ctx.call_module_typed("user", "get_name", b"{}").unwrap();
+        assert_eq!(name, "Alice");
+    }
+
+    #[test]
+    fn test_call_module_typed_i32() {
+        let mut ctx = ModuleContext::new();
+        ctx.call_module = Some(Arc::new(|_: &str, _: &str, _: &[u8]| {
+            b"99".to_vec()
+        }));
+
+        let count: i32 = ctx.call_module_typed("order", "count", b"{}").unwrap();
+        assert_eq!(count, 99);
+    }
+
+    #[test]
+    fn test_call_module_typed_no_callback() {
+        let ctx = ModuleContext::new();
+        let result: Result<String, _> = ctx.call_module_typed("user", "f", b"{}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not set"));
+    }
+
+    #[test]
+    fn test_call_service_typed() {
+        let mut ctx = ModuleContext::new();
+        ctx.call_service = Some(Arc::new(|_: &str, _: &str, _: &[u8]| {
+            b"200".to_vec()
+        }));
+
+        let count: i32 = ctx.call_service_typed("redis", "cache", b"GET counter").unwrap();
+        assert_eq!(count, 200);
     }
 }

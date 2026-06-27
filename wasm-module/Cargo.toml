@@ -10,3 +10,9 @@ keywords = ["wasm", "web", "module", "microkernel", "actix"]
 categories = ["wasm", "web-programming::http-server"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+json = ["serde", "serde_json"]

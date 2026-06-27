@@ -1,433 +1,302 @@
-# Adding External Services
+# External Services
 
-There are two kinds of "external services" in this architecture. This guide
-covers how to add both.
+Modules access databases, caches, object storage, and HTTP APIs through **typed
+service handles** provided by the kernel. Each handle wraps a real backend
+implementation.
 
 ---
 
-## Kind 1: Kernel-Level Service Providers
+## Available Providers
 
-These are services the **kernel** manages — database pools, HTTP clients, Redis
-connections, message queues, etc. Modules access them via `ctx.call_service()`.
+| Provider | Backend | Config struct | Typed trait |
+|----------|---------|--------------|-------------|
+| **Postgres** | `sqlx::PgPool` | `PostgresConfig` | `PostgresHandle` |
+| **MySQL** | `sqlx::MySqlPool` | `MySqlConfig` | `MySqlHandle` |
+| **Redis** | `redis::Connection` | `RedisConfig` | `RedisHandle` |
+| **S3** | `ureq::Agent` | `S3Config` | `S3Handle` |
+| **HTTP** | `ureq::Agent` | `HttpConfig` | `HttpHandle` |
 
-### Architecture
+---
 
-```
-Module                   Kernel                        External World
-  │                        │                               │
-  │  call_service(         │                               │
-  │   "postgres","main_db",│                               │
-  │   b"SELECT ...")       │                               │
-  │ ──────────────────────▶│                               │
-  │                        │  ServiceRegistry              │
-  │                        │  "postgres/main_db"           │
-  │                        │      │                        │
-  │                        │      ▼                        │
-  │                        │  PostgresProvider.call()      │
-  │                        │      │                        │
-  │                        │      │  pool.execute(sql) ───▶│  PostgreSQL
-  │                        │      │                        │
-  │                        │      │ ◀── rows ──────────────│
-  │                        │      │                        │
-  │  ◀── bytes ────────────│      │                        │
-```
-
-### Step 1: Implement `ServiceProvider`
-
-```rust
-// server/src/services.rs
-
-use std::sync::Arc;
-
-/// The trait every service provider must implement.
-pub trait ServiceProvider: Send + Sync {
-    /// Execute a call against this service.
-    /// `method` is service-specific (SQL, URL, command name, etc.).
-    fn call(&self, method: &str, payload: &[u8]) -> Vec<u8>;
-}
-```
-
-#### Example: Real Postgres Provider (using sqlx)
-
-```rust
-use sqlx::postgres::PgPool;
-use std::sync::Arc;
-
-pub struct PostgresProvider {
-    pool: PgPool,
-}
-
-impl PostgresProvider {
-    pub async fn new(url: &str) -> Self {
-        let pool = PgPool::connect(url).await
-            .expect("failed to connect to Postgres");
-        Self { pool }
-    }
-}
-
-impl ServiceProvider for PostgresProvider {
-    fn call(&self, _method: &str, payload: &[u8]) -> Vec<u8> {
-        let sql = String::from_utf8_lossy(payload).to_string();
-
-        // Use tokio runtime to block on async DB call
-        let rt = tokio::runtime::Handle::current();
-        let rows = rt.block_on(async {
-            sqlx::query(&sql)
-                .fetch_all(&self.pool)
-                .await
-        });
-
-        match rows {
-            Ok(rows) => {
-                // Serialise rows to JSON
-                let json_rows: Vec<serde_json::Value> = rows
-                    .iter()
-                    .map(|row| {
-                        // Convert each row to a JSON object
-                        // (simplified — real impl uses row columns)
-                        serde_json::json!({"row": "data"})
-                    })
-                    .collect();
-                serde_json::json!({"rows": json_rows}).to_string().into_bytes()
-            }
-            Err(e) => {
-                serde_json::json!({"error": e.to_string()}).to_string().into_bytes()
-            }
-        }
-    }
-}
-```
-
-#### Example: Real HTTP Client Provider (using reqwest)
-
-```rust
-pub struct HttpClientProvider {
-    client: reqwest::Client,
-}
-
-impl HttpClientProvider {
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
-}
-
-impl ServiceProvider for HttpClientProvider {
-    fn call(&self, method: &str, payload: &[u8]) -> Vec<u8> {
-        let url = String::from_utf8_lossy(payload).to_string();
-
-        let rt = tokio::runtime::Handle::current();
-        let result = rt.block_on(async {
-            match method.to_lowercase().as_str() {
-                "get" => self.client.get(&url).send().await,
-                "post" => self.client.post(&url).body(url.clone()).send().await,
-                _ => return b"{\"error\":\"unsupported method\"}".to_vec(),
-            }
-        });
-
-        match result {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = rt.block_on(resp.text()).unwrap_or_default();
-                format!(r#"{{"status":{},"body":"{}"}}"#, status, body).into_bytes()
-            }
-            Err(e) => {
-                format!(r#"{{"error":"{}"}}"#, e).into_bytes()
-            }
-        }
-    }
-}
-```
-
-#### Example: Real Redis Provider (using redis-rs)
-
-```rust
-pub struct RedisProvider {
-    client: redis::Client,
-}
-
-impl RedisProvider {
-    pub fn new(url: &str) -> Self {
-        let client = redis::Client::open(url)
-            .expect("failed to connect to Redis");
-        Self { client }
-    }
-}
-
-impl ServiceProvider for RedisProvider {
-    fn call(&self, method: &str, payload: &[u8]) -> Vec<u8> {
-        let args = String::from_utf8_lossy(payload).to_string();
-
-        let rt = tokio::runtime::Handle::current();
-        let mut conn = rt.block_on(
-            self.client.get_multiplexed_async_connection()
-        ).expect("redis connection failed");
-
-        let result: Result<String, _> = rt.block_on(async {
-            match method.to_lowercase().as_str() {
-                "get" => redis::cmd("GET").arg(&args).query_async(&mut conn).await,
-                "set" => {
-                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                    redis::cmd("SET")
-                        .arg(parts[0])
-                        .arg(parts.get(1).unwrap_or(&""))
-                        .query_async(&mut conn).await
-                }
-                "del" => redis::cmd("DEL").arg(&args).query_async(&mut conn).await,
-                _ => return b"{\"error\":\"unsupported command\"}".to_vec(),
-            }
-        });
-
-        match result {
-            Ok(val) => format!(r#"{{"result":"{}"}}"#, val).into_bytes(),
-            Err(e) => format!(r#"{{"error":"{}"}}"#, e).into_bytes(),
-        }
-    }
-}
-```
-
-### Step 2: Register with the Kernel
-
-In `server/src/main.rs`, after creating the `ServiceRegistry`:
-
-```rust
-// Create the service provider at startup
-let pg_pool = PgPool::connect("postgres://localhost/mydb").await?;
-let pg_provider = PostgresProvider { pool: pg_pool };
-
-// Register it with the kernel
-service_registry.register_service(
-    "postgres",        // kind (must match what modules use)
-    "main_db",         // identifier (must match what modules use)
-    pg_provider,
-);
-
-// Register more providers
-service_registry.register_service("http", "default", HttpClientProvider::new());
-service_registry.register_service("redis", "cache", RedisProvider::new("redis://localhost"));
-
-// Custom providers — any kind/identifier pair works
-service_registry.register_service("grpc", "user_service", GrpcProvider::new(addr));
-service_registry.register_service("kafka", "events", KafkaProvider::new(brokers));
-```
-
-### Step 3: Use from a Module
+## How Modules Use Them
 
 ```rust
 impl WasmModule for MyModule {
+    fn register(&self, ctx: &mut ModuleContext) {
+        // Clone typed handles before mutable borrows
+        let pg = ctx.postgres.clone();
+        let redis = ctx.redis.clone();
+        let s3 = ctx.s3.clone();
+        let http = ctx.http.clone();
+
+        ctx.get("/users", move || {
+            let rows = pg.as_ref().unwrap()
+                .query("SELECT id, name FROM users WHERE active = true")
+                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+            Response::json(rows.into_bytes())
+        })
+        .get("/cache", move || {
+            let val = redis.as_ref().unwrap()
+                .get("homepage:stats").unwrap()
+                .unwrap_or_else(|| "not cached".into());
+            Response::ok(val)
+        })
+        .get("/files", move || {
+            let data = s3.as_ref().unwrap()
+                .get("my-bucket", "hello.txt")
+                .unwrap_or_else(|e| e.as_bytes().to_vec());
+            Response::ok(String::from_utf8_lossy(&data).to_string())
+        })
+        .get("/external", move || {
+            let body = http.as_ref().unwrap()
+                .get("https://api.github.com/zen")
+                .unwrap_or_else(|e| e);
+            Response::ok(body)
+        });
+    }
+
     fn properties(&self) -> ModuleProperties {
         ModuleProperties {
             required_services: vec![
                 ServiceRequirement { kind: ServiceKind::Postgres, identifier: "main_db".into() },
-                ServiceRequirement { kind: ServiceKind::Http, identifier: "default".into() },
                 ServiceRequirement { kind: ServiceKind::Redis, identifier: "cache".into() },
+                ServiceRequirement { kind: ServiceKind::S3, identifier: "assets".into() },
             ],
             ..Default::default()
         }
     }
-
-    fn register(&self, ctx: &mut ModuleContext) {
-        let call_svc = ctx.call_service.clone();
-
-        ctx.get("/db", move || {
-            let rows = call_svc.as_ref().unwrap()("postgres", "main_db", b"SELECT 1");
-            Response::json(rows)
-        })
-        .get("/fetch", move || {
-            let data = call_svc.as_ref().unwrap()("http", "default", b"https://api.example.com");
-            Response::json(data)
-        })
-        .get("/cache", move || {
-            let val = call_svc.as_ref().unwrap()("redis", "cache", b"GET mykey");
-            Response::ok(val)
-        });
-    }
 }
 ```
-
-### Adding a Custom Service Kind
-
-The `ServiceKind` enum in `wasm-module/src/lib.rs` defines recognised kinds:
-
-```rust
-pub enum ServiceKind {
-    Postgres,
-    Http,
-    Redis,
-    // Add new kinds here:
-    // Grpc,
-    // Kafka,
-    // S3,
-}
-```
-
-For completely custom providers, modules can use any `kind` string — the enum
-is just for validation in `properties()`. The kernel matches on the string key
-`"kind/identifier"`.
-
-### Built-in Demo Providers
-
-The demo includes three providers that echo back what they receive (no real
-connections needed):
-
-| Provider | What it does |
-|----------|-------------|
-| `PostgresProvider` | Logs SQL, returns `{"rows":[],"service":"postgres/main"}` |
-| `HttpClientProvider` | Logs request, echoes body back |
-| `RedisProvider` | Logs command, returns `{"result":"ok"}` |
 
 ---
 
-## Kind 2: HTTP-Based Services (Other WASM Modules)
+## Architecture
 
-Any WASM module deployed in the system is already an HTTP service. Other modules
-can interact with it in two ways.
+```
+Module handler:  pg.query("SELECT ...")
+                    │
+                    ▼
+ServiceRegistryPostgresHandle.query()
+   (thin wrapper in kernel — delegates to ServiceRegistry)
+                    │
+                    ▼
+ServiceRegistry.call_service("postgres", "main_db", json)
+                    │
+                    ▼
+PostgresProvider.call()
+   (real sqlx execution: pool.execute(sql).await)
+                    │
+                    ▼
+Returns JSON rows → back to module
+```
 
-### Option A: Inter-Module Calls (`call_module`)
+The kernel creates provider instances at startup, registers them in the
+`ServiceRegistry`, and wraps them in thin `ServiceRegistryXxxHandle` structs
+that are assigned to `ModuleContext.postgres`, `.redis`, etc.
 
-This is the **direct** way — Module B calls Module A's exported function without
-going through HTTP.
+---
+
+## Postgres Provider
 
 ```rust
-// Module B calls Module A's export
-fn register(&self, ctx: &mut ModuleContext) {
-    let call_mod = ctx.call_module.clone();
+// server/src/providers/postgres.rs
 
-    ctx.get("/call-a", move || {
-        let result = call_mod.as_ref().unwrap()(
-            "module_a",      // module name
-            "get_name",      // exported function
-            b"{}"            // arguments
-        );
-        Response::json(result)
-    });
+pub struct PostgresConfig {
+    pub url: String,                         // postgres://user:pass@host/db
+    pub max_connections: u32,                // default: 10
+    pub min_connections: u32,                // default: 1
+    pub max_lifetime: Option<Duration>,      // default: 30 min
+    pub acquire_timeout: Option<Duration>,   // default: 10 s
+    pub application_name: Option<String>,
+    pub ssl_mode: Option<String>,            // "disable", "require", etc.
 }
 ```
 
-**When to use**: Same-process, low-latency, no serialisation overhead.
-The kernel routes the call directly to `ModuleA.on_export_call()`.
+### Typed Handle Methods
 
-### Option B: HTTP Calls (via `call_service`)
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `query(sql)` | `Result<String>` | SELECT → JSON rows string |
+| `execute(sql)` | `Result<u64>` | INSERT/UPDATE/DELETE → rows affected |
+| `query_with(sql, params)` | `Result<String>` | Parameterised query ($1, $2, ...) |
 
-Module B can call Module A's HTTP endpoints the same way it calls any external
-API — through the kernel's HTTP client provider.
+### Registering at Startup
 
 ```rust
-fn register(&self, ctx: &mut ModuleContext) {
-    let call_svc = ctx.call_service.clone();
+let pg = PostgresProvider::connect(PostgresConfig {
+    url: std::env::var("DATABASE_URL").unwrap(),
+    max_connections: 20,
+    ..Default::default()
+}).await?;
 
-    ctx.get("/call-a-http", move || {
-        let result = call_svc.as_ref().unwrap()(
-            "http",           // use the HTTP provider
-            "default",        // provider identifier
-            b"http://localhost:8080/module_a/some-endpoint"
-        );
-        Response::json(result)
-    });
+service_registry.register_service("postgres", "main_db", pg);
+```
+
+If the connection fails, an `EchoProvider` fallback is registered so the demo
+still runs without a real database.
+
+---
+
+## MySQL Provider
+
+```rust
+pub struct MySqlConfig {
+    pub url: String,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub max_lifetime: Option<Duration>,
+    pub acquire_timeout: Option<Duration>,
 }
 ```
 
-**When to use**: When modules are on different hosts, when you need standard
-HTTP semantics (status codes, headers, caching), or when the called module
-expects HTTP-formatted input.
+Same typed handle methods as Postgres: `query()`, `execute()`, `query_with()`.
 
-### Comparison
+---
 
-| Aspect | `call_module` (direct) | HTTP via `call_service` |
-|--------|----------------------|------------------------|
-| Transport | In-memory function call | HTTP request |
-| Latency | Microseconds | Milliseconds |
-| Serialisation | Raw bytes (your choice) | HTTP body (your choice) |
-| Works across hosts | No (same process) | Yes |
-| Works across languages | Only Rust/WASM | Any language |
-| Status codes | Manual in bytes | HTTP response has them |
-| Middleware | Not applicable | Actix middleware applies |
-
-### Example: Building a "Payment Module" as an HTTP Service
+## Redis Provider
 
 ```rust
-struct PaymentModule;
-
-impl WasmModule for PaymentModule {
-    fn register(&self, ctx: &mut ModuleContext) {
-        // Standard HTTP endpoints — any HTTP client can call these
-        ctx.post("/charge", || Response::json(b"{\"status\":\"charged\"}".to_vec()));
-        ctx.get("/status/:id", || Response::ok("payment status"));
-        ctx.post("/refund", || Response::json(b"{\"status\":\"refunded\"}".to_vec()));
-    }
+pub struct RedisConfig {
+    pub url: String,                         // redis://[:password@]host:port[/db]
+    pub connection_timeout: Option<Duration>, // default: 5 s
+    pub default_ttl_seconds: Option<u64>,     // auto-EXPIRE on set()
+    pub key_prefix: Option<String>,           // namespace all keys
 }
 ```
 
-Any other module (or external client) can now call:
+### Typed Handle Methods
 
-```bash
-curl -X POST http://localhost:8080/payment/charge
-curl http://localhost:8080/payment/status/abc123
-```
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `get(key)` | `Result<Option<String>>` | Get a key |
+| `set(key, value, ttl)` | `Result<()>` | Set with optional TTL |
+| `del(keys)` | `Result<u64>` | Delete keys, returns count |
+| `incr(key, amount)` | `Result<i64>` | Increment, returns new value |
+| `exists(key)` | `Result<bool>` | Check existence |
 
-Or from another module:
+---
 
-```rust
-// Via inter-module call
-call_mod("payment", "process", b"{\"amount\":100}");
-
-// Via HTTP
-call_svc("http", "default", b"POST /payment/charge {\"amount\":100}");
-```
-
-### Example: Module as a gRPC-Like Service
-
-You can also build specialised protocols on top of `call_module`:
+## S3 Provider
 
 ```rust
-// Module A: gRPC-like service
-fn on_export_call(&self, function: &str, args: &[u8]) -> Vec<u8> {
-    match function {
-        "UserService.GetUser" => {
-            let req: GetUserRequest = serde_json::from_slice(args).unwrap();
-            let user = self.db.find_user(req.id);
-            serde_json::to_vec(&GetUserResponse { user }).unwrap()
-        }
-        _ => vec![],
-    }
-}
-
-// Module B: gRPC-like client
-fn register(&self, ctx: &mut ModuleContext) {
-    let call_mod = ctx.call_module.clone();
-
-    ctx.get("/user/:id", move || {
-        let req = serde_json::to_vec(&GetUserRequest { id: 42 }).unwrap();
-        let resp_bytes = call_mod.as_ref().unwrap()(
-            "user_service", "UserService.GetUser", &req
-        );
-        let user: GetUserResponse = serde_json::from_slice(&resp_bytes).unwrap();
-        Response::json(serde_json::to_vec(&user).unwrap())
-    });
+pub struct S3Config {
+    pub endpoint: String,          // https://s3.amazonaws.com or http://localhost:9000
+    pub region: String,            // us-east-1
+    pub access_key: String,        // AKIA...
+    pub secret_key: String,        // ...
+    pub session_token: Option<String>,
+    pub force_path_style: bool,    // true for MinIO, false for AWS
+    pub timeout: Option<Duration>,
 }
 ```
 
-### Summary
+Works with AWS S3, MinIO, CloudFlare R2, DigitalOcean Spaces, etc.
 
+### Typed Handle Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `put(bucket, key, data)` | `Result<String>` | Upload object |
+| `get(bucket, key)` | `Result<Vec<u8>>` | Download object |
+| `delete(bucket, key)` | `Result<bool>` | Delete object |
+| `list(bucket, prefix)` | `Result<String>` | List objects (XML response) |
+
+---
+
+## HTTP Provider
+
+```rust
+pub struct HttpConfig {
+    pub user_agent: String,
+    pub timeout: Option<Duration>,
+    pub connect_timeout: Option<Duration>,
+    pub danger_accept_invalid_certs: bool,
+}
 ```
-┌─────────────────────────────────────────────────────────┐
-│  How modules talk to other services                      │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Kernel-Level Services (ServiceProvider trait)   │   │
-│  │  • Postgres, HTTP, Redis, Kafka, S3, etc.        │   │
-│  │  • Accessed via: call_service(kind, id, payload)  │   │
-│  │  • Registered at kernel startup                  │   │
-│  └──────────────────────────────────────────────────┘   │
-│                                                          │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │  Other WASM Modules                               │   │
-│  │  ┌─────────────────┐  ┌──────────────────────┐   │   │
-│  │  │ call_module()    │  │ call_service("http") │   │   │
-│  │  │ Direct, in-proc  │  │ Standard HTTP        │   │   │
-│  │  │ (microseconds)   │  │ (milliseconds)       │   │   │
-│  │  └─────────────────┘  └──────────────────────┘   │   │
-│  └──────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+
+### Typed Handle Methods
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `get(url)` | `Result<String>` | GET request → response body |
+| `post(url, body)` | `Result<String>` | POST request |
+| `put(url, body)` | `Result<String>` | PUT request |
+| `delete(url)` | `Result<String>` | DELETE request |
+
+---
+
+## Adding a New Provider
+
+### 1. Add the typed trait to `wasm-module/src/lib.rs`
+
+```rust
+pub trait KafkaHandle: Send + Sync {
+    fn publish(&self, topic: &str, message: &[u8]) -> Result<(), String>;
+    fn subscribe(&self, topic: &str) -> Result<String, String>;
+}
 ```
+
+### 2. Add the field to `ModuleContext`
+
+```rust
+pub struct ModuleContext {
+    // ... existing fields ...
+    pub kafka: Option<Arc<dyn KafkaHandle>>,
+}
+```
+
+### 3. Implement the provider in `server/src/providers/`
+
+```rust
+pub struct KafkaProvider { /* rdkafka producer */ }
+
+impl ServiceProvider for KafkaProvider { ... }
+impl KafkaHandle for KafkaProvider { ... }
+```
+
+### 4. Register at startup in `main.rs`
+
+```rust
+service_registry.register_service("kafka", "events", kafka_provider);
+```
+
+### 5. Add a thin handle wrapper in `main.rs`
+
+```rust
+struct ServiceRegistryKafkaHandle(Arc<Mutex<ServiceRegistry>>);
+impl KafkaHandle for ServiceRegistryKafkaHandle { ... }
+
+// In build_module_context:
+ctx.kafka = Some(Arc::new(ServiceRegistryKafkaHandle(Arc::clone(&svc))));
+```
+
+### 6. Update `ServiceKind` enum if wanted
+
+```rust
+pub enum ServiceKind {
+    Postgres, Http, Redis, MySql, S3,
+    Kafka, // NEW
+}
+```
+
+---
+
+## ModuleContext Handle Fields
+
+All handle fields are `Option<Arc<dyn Trait>>` — set by the host before `register()`:
+
+```rust
+pub struct ModuleContext {
+    pub postgres: Option<Arc<dyn PostgresHandle>>,
+    pub redis:    Option<Arc<dyn RedisHandle>>,
+    pub mysql:    Option<Arc<dyn MySqlHandle>>,
+    pub s3:       Option<Arc<dyn S3Handle>>,
+    pub http:     Option<Arc<dyn HttpHandle>>,
+
+    // Raw callbacks (also available):
+    pub call_service: Option<Arc<ServiceCallFn>>,
+    pub call_module:  Option<Arc<ModuleCallFn>>,
+}
+```
+
+All are propagated to nested scopes automatically.

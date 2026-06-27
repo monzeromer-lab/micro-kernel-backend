@@ -53,17 +53,19 @@ http://localhost:8080/dashboard
 ### 3. Test the endpoints
 
 ```bash
-# Example scope
-curl http://localhost:8080/wasm/health          # → {"status":"ok"}
+# Health
+curl http://localhost:8080/wasm/health
 
-# User module
-curl http://localhost:8080/user/                # → "User Module"
-curl http://localhost:8080/user/list            # → calls Postgres via kernel
-curl http://localhost:8080/user/from-order      # → calls Order module
+# User module — typed service handles
+curl http://localhost:8080/user/                # root
+curl http://localhost:8080/user/list            # Postgres query
+curl http://localhost:8080/user/cache           # Redis get
+curl http://localhost:8080/user/files           # S3 get
+curl http://localhost:8080/user/from-order      # calls Order module
 
 # Order module
-curl http://localhost:8080/order/               # → "Order Module"
-curl http://localhost:8080/order/call-user      # → calls User module
+curl http://localhost:8080/order/               # root
+curl http://localhost:8080/order/call-user      # calls User module
 ```
 
 ---

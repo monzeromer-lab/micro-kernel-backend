@@ -144,12 +144,16 @@ ServiceProvider  ←── external service wrappers
     └── call(&self, method, payload) → Vec<u8>
 ```
 
-## Service Providers (built-in demos)
+## Service Providers (built-in demos → real implementations)
 
-| Provider | Register as | What it does |
-|----------|------------|-------------|
-| `PostgresProvider` | `postgres/main_db` | Logs SQL, returns placeholder `{"rows":[]}` |
-| `HttpClientProvider` | `http/default` | Echoes back the request body |
-| `RedisProvider` | `redis/cache` | Logs command, returns `{"result":"ok"}` |
+| Provider | Backend | Registers as | Typed trait |
+|----------|---------|-------------|-------------|
+| `PostgresProvider` | `sqlx::PgPool` | `postgres/main_db` | `PostgresHandle` |
+| `MySqlProvider` | `sqlx::MySqlPool` | `mysql/main_db` | `MySqlHandle` |
+| `RedisProvider` | `redis::Connection` | `redis/cache` | `RedisHandle` |
+| `S3Provider` | `ureq::Agent` | `s3/assets` | `S3Handle` |
+| `HttpProvider` | `ureq::Agent` | `http/default` | `HttpHandle` |
 
-In production, these would be backed by real connection pools (`sqlx`, `reqwest`, `redis-rs`).
+Each provider implements both [`ServiceProvider`] (raw `call_service`) and
+its typed handle trait (e.g. `PostgresHandle`). An `EchoProvider` fallback
+is used when the real backend is unavailable.
