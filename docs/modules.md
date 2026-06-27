@@ -92,8 +92,9 @@ impl WasmModule for UserModule {
         // -- Export a function for other modules to call --
         ctx.export("get_name");
 
-        // Clone callbacks before mutable borrows
-        let call_svc = ctx.call_service.clone();
+        // Clone typed handles before mutable borrows
+        let pg = ctx.postgres.clone();
+        let redis = ctx.redis.clone();
         let call_mod = ctx.call_module.clone();
 
         // -- Middleware + Guards --
@@ -102,21 +103,22 @@ impl WasmModule for UserModule {
         // -- Routes --
         ctx.get("/", || Response::ok("User Module Root"))
            .get("/list", move || {
-               ctx.get("/users", move || {
-                   // Typed Postgres query — no raw bytes, no manual parsing
-                   let rows = pg.as_ref().unwrap()
-                       .query("SELECT id, name FROM users WHERE active = true")
-                       .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
-                   Response::json(rows.into_bytes())
-               })
+               let rows = pg.as_ref().unwrap()
+                   .query("SELECT id, name FROM users WHERE active = true")
+                   .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+               Response::json(rows.into_bytes())
+           })
+           .get("/cache", move || {
+               let val = redis.as_ref().unwrap()
+                   .get("homepage:stats").unwrap()
+                   .unwrap_or_else(|| "not cached".into());
+               Response::ok(val)
+           })
            .get("/from-order", move || {
-               // Call the Order module's exported function
-               let result = if let Some(ref f) = call_mod {
-                   f("order", "get_info", b"{}")
-               } else {
-                   b"{\"error\":\"no module callback\"}".to_vec()
-               };
-               Response::json(result)
+               use wasm_module::FromModuleBytes;
+               let bytes = call_mod.as_ref().unwrap()("order", "get_info", b"{}");
+               let info: String = String::from_module_bytes(&bytes).unwrap_or_default();
+               Response::json(info.into_bytes())
            });
 
         // -- Nested scope with guard --
@@ -144,22 +146,19 @@ This registers:
 | GET | `/user/from-order` | Calls Order module `get_info` → returns result |
 | GET | `/user/admin/dashboard` | Blocked by AdminGuard |
 
-### Cloning Callbacks Before Mutable Borrows
+### Cloning Handles Before Mutable Borrows
 
 `ModuleContext` methods like `.get()` take `&mut self`. If your handler closure
-captures `ctx.call_service` or `ctx.call_module`, you'll get a borrow conflict.
+captures `ctx.postgres` or `ctx.call_module`, you'll get a borrow conflict.
 The pattern is:
 
 ```rust
 fn register(&self, ctx: &mut ModuleContext) {
-    let call_svc = ctx.call_service.clone();  // clone BEFORE mutable borrows
-    let call_mod = ctx.call_module.clone();
+    let pg = ctx.postgres.clone();     // clone BEFORE mutable borrows
+    let redis = ctx.redis.clone();
 
-    ctx.get("/path", move || {          // 'move' needed to take ownership
-        if let Some(ref f) = call_svc {
-            f("postgres", "main_db", b"...")
-        }
-        ...
+    ctx.get("/path", move || {         // 'move' needed to take ownership
+        pg.as_ref().unwrap().query("SELECT 1");
     });
 }
 ```
@@ -230,26 +229,26 @@ result bytes are returned to Module B. Modules never see each other's memory.
 
 ```rust
 fn register(&self, ctx: &mut ModuleContext) {
-    let call_svc = ctx.call_service.clone();
+    let pg = ctx.postgres.clone();
 
     ctx.get("/db", move || {
-        let rows = if let Some(ref f) = call_svc {
-            f("postgres", "main_db", b"SELECT * FROM users")
-        } else {
-            b"[]".to_vec()
-        };
-        Response::json(rows)
+        let rows = pg.as_ref().unwrap()
+            .query("SELECT * FROM users")
+            .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+        Response::json(rows.into_bytes())
     });
 }
 ```
 
 The kernel's `ServiceRegistry` holds registered providers:
 
-| Kind | Identifier | Example call |
-|------|-----------|-------------|
-| `postgres` | `main_db` | `f("postgres", "main_db", sql_bytes)` |
-| `http` | `default` | `f("http", "default", url_bytes)` |
-| `redis` | `cache` | `f("redis", "cache", command_bytes)` |
+| Handle | Method example |
+|--------|---------------|
+| `ctx.postgres` | `pg.query("SELECT ...")` |
+| `ctx.redis` | `redis.get("key")` |
+| `ctx.mysql` | `mysql.query("SELECT ...")` |
+| `ctx.s3` | `s3.get("bucket", "key")` |
+| `ctx.http` | `http.get("https://...")` |
 
 ### Declaring Service Dependencies
 

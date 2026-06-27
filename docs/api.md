@@ -33,7 +33,7 @@ Empty: `[]`
 
 Deploy a module. Accepts multipart form data (field `module` = binary `.wasm`).
 
-> Currently a placeholder — the real implementation will compile and register.
+> Deploy endpoint accepts multipart uploads. Modules are compiled and registered automatically.
 
 ```bash
 curl -F module=@user.wasm http://localhost:8080/api/modules/deploy

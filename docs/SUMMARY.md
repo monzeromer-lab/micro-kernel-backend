@@ -234,19 +234,31 @@ impl WasmModule for UserModule {
     fn register(&self, ctx: &mut ModuleContext) {
         ctx.export("get_name");  // other modules can call this
 
-        let call_svc = ctx.call_service.clone();  // clone before mutable borrows
+        // Clone typed handles before mutable borrows
+        let pg = ctx.postgres.clone();
+        let redis = ctx.redis.clone();
         let call_mod = ctx.call_module.clone();
 
         ctx.middleware(AuthMiddleware)
            .guard(AdminGuard)
            .get("/", || Response::ok("User Module"))
            .get("/list", move || {
-               let rows = call_svc.as_ref().unwrap()("postgres", "main_db", b"SELECT ...");
-               Response::json(rows)
+               let rows = pg.as_ref().unwrap()
+                   .query("SELECT id, name FROM users WHERE active = true")
+                   .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
+               Response::json(rows.into_bytes())
+           })
+           .get("/cache", move || {
+               let val = redis.as_ref().unwrap()
+                   .get("homepage:stats").unwrap()
+                   .unwrap_or_else(|| "not cached".into());
+               Response::ok(val)
            })
            .get("/from-order", move || {
-               let info = call_mod.as_ref().unwrap()("order", "get_info", b"{}");
-               Response::json(info)
+               use wasm_module::FromModuleBytes;
+               let bytes = call_mod.as_ref().unwrap()("order", "get_info", b"{}");
+               let info: String = String::from_module_bytes(&bytes).unwrap_or_default();
+               Response::json(info.into_bytes())
            });
     }
 
@@ -277,9 +289,13 @@ They only implement a trait and use a builder API (`ModuleContext`).
 ```
 1. Kernel startup
    │
-2. Create ModuleContext with callbacks wired to ServiceRegistry
+2. Create ModuleContext with callbacks and typed handles wired to ServiceRegistry
    │   ctx.call_service = Arc::new(|kind, id, payload| { svc_registry.call_service(...) })
    │   ctx.call_module  = Arc::new(|mod, func, args|  { svc_registry.call_export(...)  })
+   │   ctx.postgres     = Arc::new(ServiceRegistryPostgresHandle(svc))
+   │   ctx.redis        = Arc::new(ServiceRegistryRedisHandle(svc))
+   │   ctx.s3           = Arc::new(ServiceRegistryS3Handle(svc))
+   │   ctx.http         = Arc::new(ServiceRegistryHttpHandle(svc))
    │
 3. Create module instance
    │   let module = Arc::new(UserModule);
@@ -323,13 +339,13 @@ They only implement a trait and use a builder API (`ModuleContext`).
 2. Actix matches route (registered during step 7 above)
          │
 3. Handler closure executes:
-   │   call_svc("postgres", "main_db", b"SELECT ...")
+   │   pg.query("SELECT ...")   ← typed Postgres handle
    │       │
    │       ▼
-   │   ServiceRegistry.call_service("postgres", "main_db", ...)
+   │   ServiceRegistryPostgresHandle.query() delegates to ServiceRegistry
    │       │
    │       ▼
-   │   PostgresProvider.call("SELECT ...")
+   │   PostgresProvider.call() → real sqlx pool execution
    │       │
    │       ▼
    │   Returns bytes: {"rows":[{"id":1,"name":"Alice"}]}
@@ -477,37 +493,42 @@ MessagePack, Protobuf, etc.). The kernel doesn't inspect or transform the data.
 
 ## External Services
 
-Modules never open sockets or connect to databases directly. They call the
-kernel, which routes to the appropriate service provider.
+Modules never open sockets or connect to databases directly. They use **typed
+handles** provided by the kernel — `pg.query()`, `redis.get()`, `s3.put()`.
 
 ### Calling a Service
 
 ```rust
 // In a module handler:
-let rows = call_svc.as_ref().unwrap()(
-    "postgres",    // service kind
-    "main_db",     // provider identifier
-    b"SELECT ..."  // payload (service-specific)
-);
+let rows = pg.as_ref().unwrap()
+    .query("SELECT id, name FROM users WHERE active = true")
+    .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
 ```
 
 ### Registering a Provider
 
 ```rust
 // At kernel startup:
-service_registry.register_service(
-    "postgres", "main_db",
-    PostgresProvider { pool: pg_pool }
-);
+let pg = PostgresProvider::connect(PostgresConfig {
+    url: std::env::var("DATABASE_URL").unwrap(),
+    max_connections: 20,
+    ..Default::default()
+}).await?;
+service_registry.register_service("postgres", "main_db", pg);
 ```
 
-### Built-in Providers (demo)
+### Built-in Providers
 
-| Provider | What it does |
-|----------|-------------|
-| `PostgresProvider` | Logs SQL, returns placeholder JSON |
-| `HttpClientProvider` | Echoes back the request |
-| `RedisProvider` | Logs command, returns `{"result":"ok"}` |
+| Provider | Backend | Typed trait |
+|----------|---------|------------|
+| `PostgresProvider` | `sqlx::PgPool` | `PostgresHandle` |
+| `MySqlProvider` | `sqlx::MySqlPool` | `MySqlHandle` |
+| `RedisProvider` | `redis::Connection` | `RedisHandle` |
+| `S3Provider` | `ureq::Agent` | `S3Handle` |
+| `HttpProvider` | `ureq::Agent` | `HttpHandle` |
+
+If the real backend is unavailable, an `EchoProvider` fallback is registered
+so the demo still runs.
 
 ### Adding Real Providers
 
@@ -642,7 +663,7 @@ wasm/
 | Communication model | Host-mediated | Modules never see each other's memory. Kernel copies data. |
 | Data format | Raw bytes (`Vec<u8>`) | Universal. Modules pick their own serialisation (JSON, Protobuf, etc.) |
 | Handler storage | Closures in `Box<dyn Handler>` | Zero-cost when native, replaced by wasmtime `Func` for WASM |
-| Service access | `ServiceProvider` trait | One interface for all external services. Swap Postgres for MySQL without changing module code. |
+| Service access | Typed handle traits (`PostgresHandle`, etc.) + `ServiceProvider` fallback | Ergonomic, type-safe API per service. One interface for all backends. |
 | Blue-green slots | Exactly two per module | Simplest useful model. Instant rollback without complexity. |
 | SDK as separate crate | `wasm-module` (zero heavy deps) | Module authors don't pull in actix-web or wasmtime. Publishable to crates.io. |
 | Trait-based module contract | `WasmModule` trait | Type-safe. Compiler checks that every module implements the required methods. |
@@ -659,8 +680,8 @@ concepts, but it's not production-ready. Specifically:
 | Limitation | Current state | Production path |
 |-----------|--------------|----------------|
 | WASM modules | Trait implemented by native Rust structs | Compile to `wasm32-unknown-unknown`, load via wasmtime |
-| Database connections | Placeholder providers that echo back | Real `sqlx` pools with connection pooling |
-| HTTP client | Placeholder that echoes | Real `reqwest` client |
+| Database connections | Providers use real libraries (sqlx, redis-rs, ureq). Need real DB URLs. | Set `DATABASE_URL`, `REDIS_URL` env vars. If unavailable, EchoProvider fallback. |
+| HTTP client | Real `ureq` client. | Already production-ready for sync use. Async version needs `reqwest`. |
 | Persistence | Everything in-memory | Store module registry state on disk |
 | Connection draining on swap | Not implemented | Wait for in-flight requests to old version before activating new |
 | Module discovery | File watcher with TODO | Full wasmtime compilation + instantiation pipeline |

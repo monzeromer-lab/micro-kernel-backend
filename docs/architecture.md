@@ -46,18 +46,17 @@
 
 ```
 1. Module's handler runs:
-   call_service("postgres", "main_db", b"SELECT ...")
+   pg.query("SELECT ...")    ← typed handle, not raw bytes
          │
-2. Host callback executes (set during deploy):
-   svc_registry.call_service("postgres", "main_db", ...)
+2. ServiceRegistryPostgresHandle.query() delegates:
+   svc_registry.call_service("postgres", "main_db", json)
          │
 3. ServiceRegistry looks up "postgres/main_db"
-   → finds PostgresProvider
+   → finds PostgresProvider (sqlx pool)
          │
-4. PostgresProvider.call(sql) runs
-   (in production: uses sqlx/tokio-postgres pool)
+4. PostgresProvider.call() runs real SQL via pool
          │
-5. Returns bytes → back to module → turned into Response
+5. Returns JSON rows → back to module
 ```
 
 ## Data Flow: Inter-Module Call
@@ -129,9 +128,12 @@ WasmModule: Send + Sync  ←── every module implements this
     │       ├── ctx.export("name")             (inter-module exports)  ← NEW
     │       ├── ctx.middleware / ctx.guard      (interceptors)
     │       │
-    │       │  Module handlers can use:
-    │       ├── ctx.call_service("postgres", "main_db", sql)   ← NEW
-    │       └── ctx.call_module("user", "get_name", args)      ← NEW
+    │       │  Module handlers can use typed handles:
+    │       ├── pg.query("SELECT ...")           ← PostgresHandle
+    │       ├── redis.get("key")                  ← RedisHandle
+    │       ├── s3.get("bucket", "key")          ← S3Handle
+    │       ├── http.get("https://...")           ← HttpHandle
+    │       └── call_module("user", "fn", args)   ← inter-module
     │
     ├── properties(&self) → ModuleProperties
     │       memory_pages, required_services, required_modules   ← NEW
