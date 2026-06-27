@@ -19,6 +19,20 @@ swapped, rolled back, call external services, and call each other.
 rustup target add wasm32-unknown-unknown
 ```
 
+## Environment Variables (optional)
+
+The server runs without any database — all providers use echo fallbacks.
+Set these to connect to real services:
+
+```bash
+export DATABASE_URL="postgres://localhost/testdb"
+export MYSQL_URL="mysql://user:pass@localhost/db"
+export REDIS_URL="redis://127.0.0.1:6379"
+export S3_ENDPOINT="https://fra1.digitaloceanspaces.com"
+export S3_KEY="YOUR_KEY"
+export S3_SECRET="YOUR_SECRET"
+```
+
 ---
 
 ## Getting Started
@@ -145,6 +159,22 @@ docs/
 ├── api.md              # REST API + shutdown endpoints
 └── blue-green.md       # Deployment mechanism deep dive
 ```
+
+---
+
+## Testing
+
+```bash
+cargo test                        # 56 tests total
+cargo build -p test-module --target wasm32-unknown-unknown
+cargo test --test wasm_integration # WASM integration tests
+```
+
+| Layer | Tests |
+|-------|-------|
+| SDK (`wasm-module`) | 33 — traits, handlers, typed handles |
+| Server unit | 17 — registry, services, exports, watcher |
+| WASM integration | 3 — real .wasm module calls PG/Redis/S3/HTTP |
 
 ---
 

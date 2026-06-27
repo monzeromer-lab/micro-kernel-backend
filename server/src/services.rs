@@ -90,3 +90,99 @@ impl ServiceRegistry {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use wasm_module::{ModuleContext, WasmModule};
+
+    struct TestProvider(&'static str);
+    impl ServiceProvider for TestProvider {
+        fn call(&self, _m: &str, payload: &[u8]) -> Vec<u8> {
+            format!("{}:{}", self.0, String::from_utf8_lossy(payload)).into_bytes()
+        }
+    }
+
+    #[test]
+    fn register_and_call_service() {
+        let mut svc = ServiceRegistry::new();
+        svc.register_service("test", "demo", TestProvider("tp"));
+        let r = svc.call_service("test", "demo", "", b"hello");
+        assert_eq!(String::from_utf8(r).unwrap(), "tp:hello");
+    }
+
+    #[test]
+    fn unknown_service_returns_error() {
+        let svc = ServiceRegistry::new();
+        let r = svc.call_service("no", "svc", "", b"hi");
+        let s = String::from_utf8(r).unwrap();
+        assert!(s.contains("error"));
+    }
+
+    #[test]
+    fn multiple_services() {
+        let mut svc = ServiceRegistry::new();
+        svc.register_service("a", "1", TestProvider("A"));
+        svc.register_service("b", "2", TestProvider("B"));
+        assert_eq!(String::from_utf8(svc.call_service("a", "1", "", b"x")).unwrap(), "A:x");
+        assert_eq!(String::from_utf8(svc.call_service("b", "2", "", b"y")).unwrap(), "B:y");
+    }
+
+    struct TestModule;
+    impl WasmModule for TestModule {
+        fn register(&self, ctx: &mut wasm_module::ModuleContext) {
+            ctx.export("hello").export("world");
+        }
+        fn on_export_call(&self, f: &str, _: &[u8]) -> Vec<u8> {
+            match f { "hello" => b"HELLO".to_vec(), "world" => b"WORLD".to_vec(), _ => vec![] }
+        }
+    }
+
+    #[test]
+    fn register_and_call_export() {
+        let mut svc = ServiceRegistry::new();
+        let mut ctx = ModuleContext::new();
+        let m: Arc<dyn WasmModule> = Arc::new(TestModule);
+        m.register(&mut ctx);
+        svc.register_exports("mod", &ctx, m.clone());
+
+        assert_eq!(svc.call_export("mod", "hello", b""), b"HELLO");
+        assert_eq!(svc.call_export("mod", "world", b""), b"WORLD");
+    }
+
+    #[test]
+    fn unknown_export_returns_error() {
+        let svc = ServiceRegistry::new();
+        let r = svc.call_export("mod", "nope", b"");
+        assert!(String::from_utf8(r).unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn remove_exports_then_call_fails() {
+        let mut svc = ServiceRegistry::new();
+        let mut ctx = ModuleContext::new();
+        let m: Arc<dyn WasmModule> = Arc::new(TestModule);
+        m.register(&mut ctx);
+        svc.register_exports("mod", &ctx, m.clone());
+
+        assert!(!String::from_utf8(svc.call_export("mod", "hello", b"")).unwrap().contains("error"));
+        svc.remove_exports("mod");
+        assert!(String::from_utf8(svc.call_export("mod", "hello", b"")).unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn inter_module_cross_calling() {
+        let mut svc = ServiceRegistry::new();
+        let mut ctx_a = ModuleContext::new();
+        let ma: Arc<dyn WasmModule> = Arc::new(TestModule);
+        ma.register(&mut ctx_a);
+        svc.register_exports("mod_a", &ctx_a, ma.clone());
+        assert_eq!(svc.call_export("mod_a", "hello", b"{}"), b"HELLO");
+        assert_eq!(svc.call_export("mod_a", "world", b"{}"), b"WORLD");
+    }
+}

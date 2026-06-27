@@ -157,5 +157,7 @@ ServiceProvider  ←── external service wrappers
 | `HttpProvider` | `ureq::Agent` | `http/default` | `HttpHandle` |
 
 Each provider implements both [`ServiceProvider`] (raw `call_service`) and
-its typed handle trait (e.g. `PostgresHandle`). An `EchoProvider` fallback
-is used when the real backend is unavailable.
+its typed handle trait (e.g. `PostgresHandle`). Postgres and MySQL use
+**OS-thread async execution** (`std::thread::spawn` + fresh tokio runtime)
+to avoid blocking actix worker threads. An `EchoProvider` fallback is used
+when the real backend is unavailable.

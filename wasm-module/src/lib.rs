@@ -393,6 +393,18 @@ pub enum Method {
     Patch,
 }
 
+impl Method {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Patch => "PATCH",
+        }
+    }
+}
+
 impl ModuleContext {
     pub fn new() -> Self {
         Self {
@@ -772,5 +784,300 @@ mod tests {
 
         let count: i32 = ctx.call_service_typed("redis", "cache", b"GET counter").unwrap();
         assert_eq!(count, 200);
+    }
+
+    // -- Typed handle tests ---------------------------------------------------
+
+    struct MockPostgres;
+    impl PostgresHandle for MockPostgres {
+        fn query(&self, sql: &str) -> Result<String, String> {
+            Ok(format!("result: {sql}"))
+        }
+        fn execute(&self, _sql: &str) -> Result<u64, String> { Ok(42) }
+        fn query_with(&self, sql: &str, _params: &[&str]) -> Result<String, String> {
+            Ok(format!("param: {sql}"))
+        }
+    }
+    impl MySqlHandle for MockPostgres {
+        fn query(&self, sql: &str) -> Result<String, String> { Ok(format!("mysql: {sql}")) }
+        fn execute(&self, _sql: &str) -> Result<u64, String> { Ok(99) }
+        fn query_with(&self, sql: &str, _params: &[&str]) -> Result<String, String> { Ok(format!("mysql_param: {sql}")) }
+    }
+
+    #[test]
+    fn test_typed_postgres_handle() {
+        let mut ctx = ModuleContext::new();
+        ctx.postgres = Some(Arc::new(MockPostgres));
+
+        let pg = ctx.postgres.clone().unwrap();
+        assert_eq!(pg.query("SELECT 1").unwrap(), "result: SELECT 1");
+        assert_eq!(pg.execute("DELETE").unwrap(), 42);
+        assert_eq!(pg.query_with("SELECT $1", &["x"]).unwrap(), "param: SELECT $1");
+    }
+
+    struct MockRedis;
+    impl RedisHandle for MockRedis {
+        fn get(&self, key: &str) -> Result<Option<String>, String> {
+            Ok(Some(format!("val:{key}")))
+        }
+        fn set(&self, _k: &str, _v: &str, _t: Option<u64>) -> Result<(), String> { Ok(()) }
+        fn del(&self, keys: &[&str]) -> Result<u64, String> { Ok(keys.len() as u64) }
+        fn incr(&self, _k: &str, _a: Option<i64>) -> Result<i64, String> { Ok(100) }
+        fn exists(&self, _k: &str) -> Result<bool, String> { Ok(true) }
+    }
+
+    #[test]
+    fn test_typed_redis_handle() {
+        let mut ctx = ModuleContext::new();
+        ctx.redis = Some(Arc::new(MockRedis));
+
+        let r = ctx.redis.clone().unwrap();
+        assert_eq!(r.get("k").unwrap(), Some("val:k".into()));
+        assert!(r.set("k", "v", None).is_ok());
+        assert_eq!(r.del(&["a", "b"]).unwrap(), 2);
+        assert_eq!(r.incr("c", None).unwrap(), 100);
+        assert!(r.exists("d").unwrap());
+    }
+
+    struct MockS3;
+    impl S3Handle for MockS3 {
+        fn put(&self, bucket: &str, key: &str, _data: &[u8]) -> Result<String, String> {
+            Ok(format!("{bucket}/{key}"))
+        }
+        fn get(&self, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
+            Ok(format!("{bucket}/{key}").into_bytes())
+        }
+        fn delete(&self, _b: &str, _k: &str) -> Result<bool, String> { Ok(true) }
+        fn list(&self, _b: &str, _p: Option<&str>) -> Result<String, String> {
+            Ok("<ListBucketResult/>".into())
+        }
+    }
+
+    #[test]
+    fn test_typed_s3_handle() {
+        let mut ctx = ModuleContext::new();
+        ctx.s3 = Some(Arc::new(MockS3));
+
+        let s = ctx.s3.clone().unwrap();
+        assert_eq!(s.put("b", "k.txt", b"data").unwrap(), "b/k.txt");
+        assert_eq!(s.get("b", "k.txt").unwrap(), b"b/k.txt");
+        assert!(s.delete("b", "k.txt").unwrap());
+        assert_eq!(s.list("b", None).unwrap(), "<ListBucketResult/>");
+    }
+
+    struct MockHttp;
+    impl HttpHandle for MockHttp {
+        fn get(&self, url: &str) -> Result<String, String> { Ok(format!("GET:{url}")) }
+        fn post(&self, url: &str, body: &str) -> Result<String, String> { Ok(format!("POST:{url}:{body}")) }
+        fn put(&self, url: &str, body: &str) -> Result<String, String> { Ok(format!("PUT:{url}:{body}")) }
+        fn delete(&self, url: &str) -> Result<String, String> { Ok(format!("DELETE:{url}")) }
+    }
+
+    #[test]
+    fn test_typed_http_handle() {
+        let mut ctx = ModuleContext::new();
+        ctx.http = Some(Arc::new(MockHttp));
+
+        let h = ctx.http.clone().unwrap();
+        assert_eq!(h.get("http://a").unwrap(), "GET:http://a");
+        assert_eq!(h.post("http://a", "b").unwrap(), "POST:http://a:b");
+        assert_eq!(h.put("http://a", "b").unwrap(), "PUT:http://a:b");
+        assert_eq!(h.delete("http://a").unwrap(), "DELETE:http://a");
+    }
+
+    // -- Nested scope handle propagation tests ---------------------------------
+
+    #[test]
+    fn test_nested_scope_handle_propagation() {
+        let mut ctx = ModuleContext::new();
+        ctx.postgres = Some(Arc::new(MockPostgres));
+        ctx.redis = Some(Arc::new(MockRedis));
+
+        ctx.scope("/api", |sub| {
+            // Nested scope should have inherited the handles
+            assert!(sub.postgres.is_some());
+            assert!(sub.redis.is_some());
+            let pg = sub.postgres.clone().unwrap();
+            assert_eq!(pg.query("SELECT 1").unwrap(), "result: SELECT 1");
+        });
+
+        assert_eq!(ctx.scopes.len(), 1);
+    }
+
+    // -- Multiple exports test -------------------------------------------------
+
+    #[test]
+    fn test_multiple_exports() {
+        let mut ctx = ModuleContext::new();
+        ctx.export("fn_a").export("fn_b").export("fn_c");
+
+        let exports: Vec<&String> = ctx.exports().collect();
+        assert_eq!(exports, vec!["fn_a", "fn_b", "fn_c"]);
+    }
+
+    // -- Edge case tests -------------------------------------------------------
+
+    #[test]
+    fn test_empty_context() {
+        let ctx = ModuleContext::new();
+        assert_eq!(ctx.routes().count(), 0);
+        assert_eq!(ctx.scopes().count(), 0);
+        assert_eq!(ctx.exports().count(), 0);
+        assert_eq!(ctx.middleware_entries().count(), 0);
+        assert_eq!(ctx.guard_entries().count(), 0);
+        assert!(ctx.call_service.is_none());
+        assert!(ctx.call_module.is_none());
+        assert!(ctx.postgres.is_none());
+        assert!(ctx.redis.is_none());
+    }
+
+    #[test]
+    fn test_multiple_routes_same_path_different_methods() {
+        let mut ctx = ModuleContext::new();
+        ctx.get("/path", || "get")
+           .post("/path", || "post")
+           .put("/path", || "put");
+
+        let routes: Vec<&RouteDef> = ctx.routes().collect();
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0].method, Method::Get);
+        assert_eq!(routes[1].method, Method::Post);
+        assert_eq!(routes[2].method, Method::Put);
+        // All same path
+        assert_eq!(routes[0].path, "/path");
+        assert_eq!(routes[1].path, "/path");
+    }
+
+    #[test]
+    fn test_deeply_nested_scopes() {
+        let mut ctx = ModuleContext::new();
+        ctx.scope("/a", |a| {
+            a.scope("/b", |b| {
+                b.scope("/c", |c| {
+                    c.get("/leaf", || "deep");
+                });
+            });
+        });
+
+        assert_eq!(ctx.scopes().count(), 1);
+        let a = &ctx.scopes().collect::<Vec<_>>()[0];
+        assert_eq!(a.prefix, "/a");
+        let b = &a.context.scopes().collect::<Vec<_>>()[0];
+        assert_eq!(b.prefix, "/b");
+        let c = &b.context.scopes().collect::<Vec<_>>()[0];
+        assert_eq!(c.prefix, "/c");
+        assert_eq!(c.context.routes().count(), 1);
+    }
+
+    #[test]
+    fn test_middleware_name() {
+        struct LoggerMw;
+        impl Middleware for LoggerMw {
+            fn name(&self) -> Cow<'static, str> { "logger".into() }
+            fn before(&self) -> bool { false }
+            fn after(&self) -> bool { false }
+        }
+
+        let mw = LoggerMw;
+        assert_eq!(mw.name(), "logger");
+        assert!(!mw.before());
+        assert!(!mw.after());
+    }
+
+    #[test]
+    fn test_guard_name_and_check() {
+        struct RateLimitGuard;
+        impl Guard for RateLimitGuard {
+            fn name(&self) -> Cow<'static, str> { "ratelimit".into() }
+            fn check(&self) -> bool { true }
+        }
+
+        let guard = RateLimitGuard;
+        assert_eq!(guard.name(), "ratelimit");
+        assert!(guard.check());
+    }
+
+    #[test]
+    fn test_handler_closure_with_state() {
+        let captured = "hello".to_string();
+        let handler = move || captured.clone();
+        let resp = handler.call();
+        assert_eq!(resp.status, 200);
+        assert_eq!(String::from_utf8(resp.body).unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_response_custom_headers() {
+        let resp = Response {
+            status: 201,
+            headers: vec![("x-custom".into(), "val".into())],
+            body: b"body".to_vec(),
+        };
+        assert_eq!(resp.status, 201);
+        assert_eq!(resp.headers[0].0, "x-custom");
+        assert_eq!(resp.body, b"body");
+    }
+
+    #[test]
+    fn test_from_bytes_empty() {
+        let v: Vec<u8> = FromModuleBytes::from_module_bytes(b"").unwrap();
+        assert!(v.is_empty());
+        let s: String = FromModuleBytes::from_module_bytes(b"").unwrap();
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_from_bytes_invalid_utf8_for_string() {
+        let result: Result<String, _> = FromModuleBytes::from_module_bytes(&[0xFF, 0xFE]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scope_propagates_all_handles() {
+        let mut ctx = ModuleContext::new();
+        ctx.postgres = Some(Arc::new(MockPostgres));
+        ctx.redis = Some(Arc::new(MockRedis));
+        ctx.mysql = Some(Arc::new(MockPostgres)); // same mock works
+        ctx.http = Some(Arc::new(MockHttp));
+        ctx.s3 = Some(Arc::new(MockS3));
+
+        ctx.scope("/sub", |sub| {
+            assert!(sub.postgres.is_some());
+            assert!(sub.redis.is_some());
+            assert!(sub.mysql.is_some());
+            assert!(sub.http.is_some());
+            assert!(sub.s3.is_some());
+        });
+    }
+
+    #[test]
+    fn test_method_as_str() {
+        assert_eq!(Method::Get.as_str(), "GET");
+        assert_eq!(Method::Post.as_str(), "POST");
+        assert_eq!(Method::Put.as_str(), "PUT");
+        assert_eq!(Method::Delete.as_str(), "DELETE");
+        assert_eq!(Method::Patch.as_str(), "PATCH");
+    }
+
+    #[test]
+    fn test_module_properties_full() {
+        let props = ModuleProperties {
+            memory_pages: 10,
+            max_memory_pages: Some(100),
+            memory64: true,
+            consume_fuel: true,
+            max_wasm_stack: Some(1_048_576),
+            required_services: vec![
+                ServiceRequirement { kind: ServiceKind::Postgres, identifier: "db".into() },
+                ServiceRequirement { kind: ServiceKind::S3, identifier: "files".into() },
+            ],
+            required_modules: vec!["auth".into(), "logging".into()],
+        };
+
+        assert_eq!(props.memory_pages, 10);
+        assert!(props.memory64);
+        assert!(props.consume_fuel);
+        assert_eq!(props.required_services.len(), 2);
+        assert_eq!(props.required_modules.len(), 2);
     }
 }

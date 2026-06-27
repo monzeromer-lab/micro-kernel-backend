@@ -12,15 +12,15 @@ mod services;
 mod watcher;
 
 use actix_web::{web, App, HttpServer};
+use actix_web::dev::ServerHandle;
 use std::sync::{Arc, Mutex};
 
-use actix_web::dev::ServerHandle;
+type ShutdownHandle = Arc<Mutex<Option<ServerHandle>>>;
+
 use engine::WasmtimeConfig;
 use registry::ModuleRegistry;
 use services::ServiceRegistry;
 use wasm_module::{ModuleContext, ModuleProperties, Response, ServiceKind, WasmModule};
-
-pub type ShutdownHandle = Arc<Mutex<Option<ServerHandle>>>;
 
 // ---------------------------------------------------------------------------
 // Example modules
@@ -39,7 +39,7 @@ impl WasmModule for UserModule {
         ctx.get("/", || Response::ok("User Module — /user/"))
            .get("/list", move || {
                let rows = pg.as_ref().unwrap()
-                   .query("SELECT id, name FROM users WHERE active = true")
+                   .query("SELECT id, name FROM users")
                    .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e));
                Response::json(rows.into_bytes())
            })
@@ -130,8 +130,12 @@ async fn main() -> std::io::Result<()> {
     // -- Connect providers, register in ServiceRegistry -----------------------
     let mut service_registry = ServiceRegistry::new();
 
-    // Postgres — real sqlx or echo fallback
-    match providers::postgres::PostgresProvider::connect(Default::default()).await {
+    // Postgres
+    let pg_config = providers::postgres::PostgresConfig {
+        url: std::env::var("DATABASE_URL").unwrap_or_default(),
+        ..Default::default()
+    };
+    match providers::postgres::PostgresProvider::connect(pg_config).await {
         Ok(pg) => {
             service_registry.register_service("postgres", "main_db", pg);
             println!("[services] postgres/main_db connected");
@@ -142,9 +146,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    // Redis (sync connect, must run off async runtime)
-    let redis_result = tokio::task::spawn_blocking(|| {
-        providers::redis_provider::RedisProvider::connect(Default::default())
+    // Redis
+    let redis_config = providers::redis_provider::RedisConfig {
+        url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()),
+        ..Default::default()
+    };
+    let redis_result = tokio::task::spawn_blocking(move || {
+        providers::redis_provider::RedisProvider::connect(redis_config)
     }).await.unwrap();
     match redis_result {
         Ok(r) => {
@@ -158,7 +166,11 @@ async fn main() -> std::io::Result<()> {
     }
 
     // MySQL
-    match providers::mysql::MySqlProvider::connect(Default::default()).await {
+    let mysql_config = providers::mysql::MySqlConfig {
+        url: std::env::var("MYSQL_URL").unwrap_or_default(),
+        ..Default::default()
+    };
+    match providers::mysql::MySqlProvider::connect(mysql_config).await {
         Ok(my) => {
             service_registry.register_service("mysql", "main_db", my);
             println!("[services] mysql/main_db connected");
@@ -170,7 +182,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     // S3
-    match providers::s3::S3Provider::connect(Default::default()) {
+    let s3_config = providers::s3::S3Config {
+        endpoint: std::env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into()),
+        access_key: std::env::var("S3_KEY").unwrap_or_default(),
+        secret_key: std::env::var("S3_SECRET").unwrap_or_default(),
+        region: std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        force_path_style: true,
+        ..Default::default()
+    };
+    match providers::s3::S3Provider::connect(s3_config) {
         Ok(s3) => {
             service_registry.register_service("s3", "assets", s3);
             println!("[services] s3/assets connected");

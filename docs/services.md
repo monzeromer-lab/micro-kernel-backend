@@ -18,6 +18,49 @@ implementation.
 
 ---
 
+## Environment Variables
+
+All providers read configuration from environment variables at startup.
+When env vars are missing or connections fail, **echo fallback providers**
+are registered — the server always starts.
+
+| Variable | Provider | Example |
+|----------|----------|---------|
+| `DATABASE_URL` | Postgres | `postgres://localhost/testdb` |
+| `MYSQL_URL` | MySQL | `mysql://user:pass@localhost/db` |
+| `REDIS_URL` | Redis | `redis://127.0.0.1:6379` |
+| `S3_ENDPOINT` | S3 | `https://fra1.digitaloceanspaces.com` |
+| `S3_KEY` | S3 | Your access key |
+| `S3_SECRET` | S3 | Your secret key |
+| `S3_REGION` | S3 | `fra1` (default: `us-east-1`) |
+
+## Async Execution (Postgres & MySQL)
+
+Postgres and MySQL use `sqlx` which requires an async runtime. Since Actix
+handlers run on single-threaded arbiters that can't block, the providers
+**spawn OS threads** to execute queries:
+
+```
+Module handler (actix thread)
+    │
+    ▼
+pg.query("SELECT ...")  ← PostgresHandle trait
+    │
+    ▼
+std::thread::spawn(|| {           ← fresh OS thread
+    tokio::runtime::Runtime::new()  ← fresh tokio runtime
+        .block_on(sqlx::query(...))  ← async DB call
+})
+    │
+    ▼
+Result returned to actix thread
+```
+
+This ensures the actix worker thread is never blocked while a database
+query runs. Redis and S3/HTTP providers are synchronous (no async needed).
+
+---
+
 ## How Modules Use Them
 
 ```rust

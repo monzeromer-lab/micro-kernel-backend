@@ -218,3 +218,92 @@ fn chrono_now() -> String {
         "unknown".into()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_module::ModuleContext;
+
+    #[test]
+    fn deploy_single_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("user", ModuleContext::new(), (1, 0, 0), None);
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        assert_eq!(reg.snapshot().len(), 1);
+        assert_eq!(reg.snapshot()[0].name, "user");
+    }
+
+    #[test]
+    fn deploy_auto_swaps_on_second_deploy() {
+        let mut reg = ModuleRegistry::new();
+        let (s1, sw1) = reg.deploy("svc", ModuleContext::new(), (1, 0, 0), None);
+        assert_eq!(s1, "green");
+        assert!(sw1); // auto-activates on first deploy
+        assert_eq!(reg.snapshot()[0].active_slot, "green");
+
+        let (s2, sw2) = reg.deploy("svc", ModuleContext::new(), (2, 0, 0), None);
+        assert_eq!(s2, "blue");
+        assert!(sw2); // both full → auto-swap
+        assert_eq!(reg.snapshot()[0].active_slot, "blue");
+    }
+
+    #[test]
+    fn manual_swap() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("svc", ModuleContext::new(), (1, 0, 0), None);
+        reg.deploy("svc", ModuleContext::new(), (2, 0, 0), None);
+        let active_before = reg.snapshot()[0].active_slot.clone();
+
+        let result = reg.swap("svc");
+        assert!(result.is_some());
+        assert_ne!(reg.snapshot()[0].active_slot, active_before);
+    }
+
+    #[test]
+    fn swap_fails_when_inactive_empty() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("svc", ModuleContext::new(), (1, 0, 0), None);
+        assert!(reg.swap("svc").is_none());
+    }
+
+    #[test]
+    fn swap_nonexistent_module() {
+        let mut reg = ModuleRegistry::new();
+        assert!(reg.swap("nope").is_none());
+    }
+
+    #[test]
+    fn remove_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("svc", ModuleContext::new(), (1, 0, 0), None);
+        assert!(reg.remove("svc"));
+        assert!(reg.is_empty());
+        assert!(!reg.remove("svc"));
+    }
+
+    #[test]
+    fn multiple_modules_sorted() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("z", ModuleContext::new(), (1, 0, 0), None);
+        reg.deploy("a", ModuleContext::new(), (1, 0, 0), None);
+        reg.deploy("m", ModuleContext::new(), (1, 0, 0), None);
+        let snap = reg.snapshot();
+        assert_eq!(snap[0].name, "a");
+        assert_eq!(snap[1].name, "m");
+        assert_eq!(snap[2].name, "z");
+    }
+
+    #[test]
+    fn version_tracking() {
+        let mut reg = ModuleRegistry::new();
+        reg.deploy("svc", ModuleContext::new(), (3, 2, 1), None);
+        let snap = reg.snapshot();
+        let slot = snap[0].green.as_ref().unwrap();
+        assert_eq!(slot.version, "3.2.1");
+    }
+}

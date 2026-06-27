@@ -2,6 +2,8 @@
 members = [
     "server",
     "wasm-module",
+    "test-module",
 ]
+default-members = ["server", "wasm-module"]
 
 resolver = "2"
