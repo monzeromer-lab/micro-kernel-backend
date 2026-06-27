@@ -115,6 +115,7 @@ wasm/
 
 ## Further Reading
 
+- [Building Modules](BUILDING_MODULES.md) — complete guide for module authors
 - [Architecture](architecture.md) — kernel internals, data flow, OS-thread execution
 - [Creating Modules](modules.md) — full API reference for module authors
 - [External Services](services.md) — provider guide, config, adding new ones

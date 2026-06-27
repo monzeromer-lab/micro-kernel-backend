@@ -150,6 +150,8 @@ wasm/
 
 ```
 docs/
+├── BUILDING_MODULES.md  # Complete module authoring guide
+├── BUILDING_MODULES.md  # Complete module authoring guide
 ├── README.md           # Overview & quick start
 ├── SUMMARY.md          # Deep-dive team overview (26 KB)
 ├── architecture.md     # Kernel internals, data flow, trait hierarchy
