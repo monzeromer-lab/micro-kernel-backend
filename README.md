@@ -58,9 +58,9 @@ curl http://localhost:8080/wasm/health
 
 # User module — typed service handles
 curl http://localhost:8080/user/                # root
-curl http://localhost:8080/user/list            # Postgres query
-curl http://localhost:8080/user/cache           # Redis get
-curl http://localhost:8080/user/files           # S3 get
+curl http://localhost:8080/user/list            # Postgres query (sqlx)
+curl http://localhost:8080/user/cache           # Redis get (redis-rs)
+curl http://localhost:8080/user/files           # S3 get (ureq)
 curl http://localhost:8080/user/from-order      # calls Order module
 
 # Order module
@@ -74,12 +74,12 @@ curl http://localhost:8080/order/call-user      # calls User module
 
 | Feature | For the talk |
 |---------|-------------|
-| Dynamic module loading | Drop `.wasm` in `modules/`, watcher picks it up |
-| Blue-green deployment | Dashboard — deploy v2, Swap, instant rollback |
-| Inter-module calls | `/user/from-order` and `/order/call-user` |
-| External services | `/user/list` calls Postgres through kernel |
-| Middleware + Guards | Built into the `WasmModule` trait |
-| Graceful shutdown | Dashboard → Server Control |
+| **Typed service handles** | `pg.query()`, `redis.get()`, `s3.put()`, `http.get()` — full API per service |
+| **Real providers** | `sqlx` (Postgres/MySQL), `redis-rs` (Redis), `ureq` (S3/HTTP) with fallback |
+| **Blue-green deployment** | Dashboard — deploy v2, Swap, instant rollback |
+| **Inter-module calls** | `call_module("user", "get_name", args)` with typed `FromModuleBytes` |
+| **Middleware + Guards** | `WasmModule` trait — modules declare their own |
+| **Graceful shutdown** | Dashboard → Server Control → Graceful or Force |
 
 ---
 
@@ -89,32 +89,31 @@ curl http://localhost:8080/order/call-user      # calls User module
 wasm/
 ├── Cargo.toml              # Workspace root
 ├── README.md               # ← you are here
-├── docs/                   # Full documentation
-│   ├── README.md
-│   ├── architecture.md     # Inner workings, data flow
-│   ├── modules.md          # Module creation guide
-│   ├── services.md         # Adding external services
-│   ├── dashboard.md        # Dashboard UI guide
-│   ├── api.md              # REST API reference
-│   └── blue-green.md       # Deployment mechanism deep dive
+├── docs/                   # Full documentation (8 files)
 ├── modules/                # Drop .wasm files here
 │
-├── wasm-module/            # Module SDK crate (publishable)
+├── wasm-module/            # Module SDK crate (publishable to crates.io)
 │   ├── Cargo.toml
 │   ├── README.md
-│   └── src/lib.rs
+│   └── src/lib.rs          # WasmModule, ModuleContext, typed handles, etc.
 │
 └── server/                 # Micro-kernel runtime
-    ├── Cargo.toml
+    ├── Cargo.toml           # actix-web, wasmtime, sqlx, redis, ureq
     ├── static/dashboard.html
     └── src/
-        ├── main.rs
-        ├── dashboard.rs
-        ├── scope.rs
-        ├── registry.rs
-        ├── services.rs       # ServiceRegistry
-        ├── watcher.rs
-        └── engine/
+        ├── main.rs          # Entry point + demo modules
+        ├── dashboard.rs     # Dashboard API + shutdown
+        ├── scope.rs         # ModuleContext → Actix bridge
+        ├── registry.rs      # Module registry (blue-green)
+        ├── services.rs      # ServiceRegistry + ServiceProvider trait
+        ├── providers/       # Real provider implementations
+        │   ├── postgres.rs      # PostgresProvider (sqlx)
+        │   ├── mysql.rs         # MySqlProvider (sqlx)
+        │   ├── redis_provider.rs # RedisProvider (redis-rs)
+        │   ├── s3.rs            # S3Provider (ureq)
+        │   └── http_client.rs   # HttpProvider (ureq)
+        ├── watcher.rs       # File watcher
+        └── engine/          # wasmtime integration
 ```
 
 ---
@@ -135,15 +134,16 @@ wasm/
 
 ## Documentation
 
-```bash
+```
 docs/
 ├── README.md           # Overview & quick start
-├── architecture.md     # How the kernel works
-├── modules.md          # Writing modules (full API reference)
-├── services.md         # Adding DB, HTTP, Redis, custom providers
-├── dashboard.md        # Using the dashboard
-├── api.md              # REST API endpoints
-└── blue-green.md       # Blue-green deployment deep dive
+├── SUMMARY.md          # Deep-dive team overview (26 KB)
+├── architecture.md     # Kernel internals, data flow, trait hierarchy
+├── modules.md          # Module authoring — full API reference
+├── services.md         # Providers — Postgres, Redis, MySQL, S3, HTTP
+├── dashboard.md        # Dashboard UI guide
+├── api.md              # REST API + shutdown endpoints
+└── blue-green.md       # Deployment mechanism deep dive
 ```
 
 ---
@@ -156,9 +156,20 @@ use wasm_module::{WasmModule, ModuleContext, Response};
 struct MyModule;
 impl WasmModule for MyModule {
     fn register(&self, ctx: &mut ModuleContext) {
-        ctx.export("hello")
-           .get("/", || Response::ok("Hello!"));
+        ctx.export("hello");
+
+        // Typed service handles — real APIs
+        let pg = ctx.postgres.clone();
+
+        ctx.get("/", || Response::ok("Hello!"))
+           .get("/users", move || {
+               let rows = pg.as_ref().unwrap()
+                   .query("SELECT id, name FROM users")
+                   .unwrap_or_default();
+               Response::json(rows.into_bytes())
+           });
     }
+
     fn on_export_call(&self, f: &str, _: &[u8]) -> Vec<u8> {
         match f { "hello" => b"Hello from module".to_vec(), _ => vec![] }
     }
